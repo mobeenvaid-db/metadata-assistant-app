@@ -9,7 +9,7 @@ import json
 import logging
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -4036,6 +4036,47 @@ def update_generation_progress(run_id: str, **kwargs):
         
         flask_app.generation_progress[run_id] = progress_info
 
+def update_commit_progress(run_id: str, **kwargs):
+    """Update progress for a running commit task"""
+    if not hasattr(flask_app, 'commit_progress'):
+        flask_app.commit_progress = {}
+    if not hasattr(flask_app, 'commit_progress_last_update'):
+        flask_app.commit_progress_last_update = {}
+    
+    if run_id in flask_app.commit_progress:
+        progress_info = flask_app.commit_progress[run_id]
+        
+        # Throttling: Only update ETA calculation every 2 seconds for commit operations
+        current_time = datetime.now()
+        last_update = flask_app.commit_progress_last_update.get(run_id, current_time)
+        should_calculate_eta = (current_time - last_update).total_seconds() > 2
+        
+        # Update provided fields
+        for key, value in kwargs.items():
+            if key in progress_info:
+                progress_info[key] = value
+        
+        # Calculate overall progress if processed_objects is updated
+        if 'processed_objects' in kwargs and progress_info.get('total_objects', 0) > 0:
+            progress_info['progress'] = min(100, int((progress_info['processed_objects'] / progress_info['total_objects']) * 100))
+        
+        # Estimate completion time (throttled for performance)
+        if should_calculate_eta and progress_info.get('progress', 0) > 5 and progress_info.get('start_time'):
+            try:
+                start_time = datetime.fromisoformat(progress_info['start_time'].replace('Z', '+00:00'))
+                elapsed = current_time - start_time
+                if progress_info['progress'] > 0:
+                    total_estimated = elapsed.total_seconds() * (100 / progress_info['progress'])
+                    remaining = total_estimated - elapsed.total_seconds()
+                    if remaining > 0:
+                        completion_time = current_time + timedelta(seconds=remaining)
+                        progress_info['estimated_completion'] = completion_time.isoformat()
+                flask_app.commit_progress_last_update[run_id] = current_time
+            except Exception:
+                pass  # Ignore estimation errors
+        
+        flask_app.commit_progress[run_id] = progress_info
+
 def get_setup_manager():
     """Get or create setup manager with lazy initialization"""
     global setup_manager
@@ -4970,13 +5011,195 @@ def api_generate_by_type(catalog_name, item_type):
         logger.error(f"Error in /api/generate-by-type: {e}")
         return jsonify({"error": str(e), "success": False}), 500
 
+async def commit_metadata_with_progress(unity, items, run_id):
+    """Background function to commit metadata with progress tracking"""
+    submitted = 0
+    errors = []
+    total = len(items)
+    
+    for index, item in enumerate(items):
+        try:
+            # Update progress
+            update_commit_progress(
+                run_id,
+                processed_objects=index,
+                current_object=f"Committing {item['full_name']}...",
+                current_phase="Committing to Unity Catalog"
+            )
+            
+            full_name = item['full_name']
+            description = item['generated_comment']
+            item_type = item['type']
+            
+            # Parse full name to get components
+            parts = full_name.split('.')
+            
+            if item_type == 'schema':
+                catalog_name = parts[0]
+                schema_name = parts[1]
+                unity.update_schema_comment(catalog_name, schema_name, description)
+                
+            elif item_type == 'table':
+                catalog_name = parts[0]
+                schema_name = parts[1]
+                table_name = parts[2]
+                unity.update_table_comment(catalog_name, schema_name, table_name, description)
+                
+                # Apply tags if user checked the apply tags checkbox
+                if item.get('apply_tags'):
+                    tags = {}
+                    
+                    # Handle policy_tags (from old system) - manual tags only
+                    if item.get('policy_tags'):
+                        for tag in item['policy_tags']:
+                            if isinstance(tag, str):
+                                if '.' in tag:
+                                    key, value = tag.split('.', 1)
+                                    tags[key.lower()] = value
+                                else:
+                                    tags['policy'] = tag
+                    
+                    # Handle pii_tags (from old system) - manual tags only
+                    if item.get('pii_tags'):
+                        for tag in item['pii_tags']:
+                            if isinstance(tag, str):
+                                if tag.startswith('PII.'):
+                                    tags['classification'] = tag
+                                else:
+                                    tags['pii'] = tag
+                    
+                    # Handle custom_tags (from new system) - manual tags only
+                    if item.get('custom_tags'):
+                        for tag_pair in item['custom_tags']:
+                            if isinstance(tag_pair, dict) and tag_pair.get('key') and tag_pair.get('value'):
+                                tags[tag_pair['key']] = tag_pair['value']
+                    
+                    if tags:
+                        unity.update_tags(catalog_name, schema_name, table_name, tags=tags)
+                        logger.info(f"Applied tags to {full_name}: {tags}")
+                
+            elif item_type == 'column':
+                catalog_name = parts[0]
+                schema_name = parts[1]
+                table_name = parts[2]
+                column_name = parts[3]
+                unity.update_column_comment(catalog_name, schema_name, table_name, column_name, description)
+                
+                # Apply tags if user checked the apply tags checkbox (column-level)
+                if item.get('apply_tags'):
+                    tags = {}
+                    
+                    # Handle policy_tags (from old system) - manual tags only
+                    if item.get('policy_tags'):
+                        for tag in item['policy_tags']:
+                            if isinstance(tag, str):
+                                if '.' in tag:
+                                    key, value = tag.split('.', 1)
+                                    tags[key.lower()] = value
+                                else:
+                                    tags['policy'] = tag
+                    
+                    # Handle pii_tags (from old system) - manual tags only
+                    if item.get('pii_tags'):
+                        for tag in item['pii_tags']:
+                            if isinstance(tag, str):
+                                if tag.startswith('PII.'):
+                                    tags['classification'] = tag
+                                else:
+                                    tags['pii'] = tag
+                    
+                    # Handle custom_tags (from new system) - manual tags only
+                    if item.get('custom_tags'):
+                        for tag_pair in item['custom_tags']:
+                            if isinstance(tag_pair, dict) and tag_pair.get('key') and tag_pair.get('value'):
+                                tags[tag_pair['key']] = tag_pair['value']
+                    
+                    if tags:
+                        unity.update_tags(catalog_name, schema_name, table_name, column_name, tags)
+                        logger.info(f"Applied tags to {full_name}: {tags}")
+            
+            submitted += 1
+            logger.info(f"Successfully submitted metadata for {full_name}")
+            
+            # Record history entry for this successfully submitted item
+            try:
+                setup_manager = get_setup_manager()
+                
+                escaped_comment = item.get('generated_comment', '').replace("'", "''")
+                timestamp = datetime.now()
+                history_run_id = f"commit_{timestamp.strftime('%Y%m%d_%H%M%S')}_{submitted}"
+                
+                history_query = f"""
+                    INSERT INTO uc_metadata_assistant.generated_metadata.metadata_results 
+                    (full_name, object_type, proposed_comment, source_model, generation_style, generated_at, run_id, status)
+                    VALUES (
+                        '{item["full_name"]}',
+                        '{item.get("type", "unknown")}',
+                        '{escaped_comment}',
+                        'Manual Commit',
+                        'committed',
+                        current_timestamp(),
+                        '{history_run_id}',
+                        'committed'
+                    )
+                """
+                
+                future = run_async_in_thread(setup_manager._execute_sql(history_query))
+                result = future.result(timeout=10)
+                logger.info(f"📝 Successfully recorded commit history for {full_name}")
+                
+            except Exception as history_error:
+                logger.error(f"❌ Failed to record history for {full_name}: {history_error}")
+            
+        except PermissionError as pe:
+            logger.error(f"Permission error submitting {item['full_name']}: {pe}")
+            errors.append(f"{item['full_name']}: {str(pe)}")
+            continue
+        except ValueError as ve:
+            logger.error(f"Validation error submitting {item['full_name']}: {ve}")
+            errors.append(f"{item['full_name']}: {str(ve)}")
+            continue
+        except Exception as e:
+            logger.error(f"Error submitting {item['full_name']}: {e}")
+            errors.append(f"{item['full_name']}: {str(e)}")
+            continue
+    
+    # Final progress update
+    update_commit_progress(
+        run_id,
+        processed_objects=total,
+        current_object="Commit complete",
+        current_phase="Completed",
+        status="completed"
+    )
+    
+    # Determine overall success
+    has_permission_errors = any('Insufficient permissions' in error for error in errors)
+    overall_success = submitted > 0 and not has_permission_errors
+    
+    return {
+        'success': overall_success,
+        'submitted': submitted,
+        'errors': errors,
+        'total': total,
+        'has_permission_errors': has_permission_errors,
+        'run_id': run_id
+    }
+
 @flask_app.route("/api/submit-metadata", methods=['POST'])
 def api_submit_metadata():
-    """API endpoint to submit generated metadata to Unity Catalog with canonical DDL and tags"""
+    """API endpoint to submit generated metadata to Unity Catalog with progress tracking"""
     try:
         unity = get_unity_service()
         data = request.get_json()
         items = data.get('items', [])
+        
+        if not items:
+            return jsonify({
+                'success': False,
+                'error': 'No items provided',
+                'total': 0
+            }), 400
         
         # Validate permissions upfront for all catalogs involved
         catalogs_to_check = set()
@@ -5003,193 +5226,121 @@ def api_submit_metadata():
                 'has_permission_errors': True
             }), 403
         
-        submitted = 0
-        errors = []
+        # Generate run ID for tracking
+        run_id = f"commit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        for item in items:
-            try:
-                full_name = item['full_name']
-                description = item['generated_comment']
-                item_type = item['type']
-                
-                # Parse full name to get components
-                parts = full_name.split('.')
-                
-                if item_type == 'schema':
-                    catalog_name = parts[0]
-                    schema_name = parts[1]
-                    unity.update_schema_comment(catalog_name, schema_name, description)
-                    
-                elif item_type == 'table':
-                    catalog_name = parts[0]
-                    schema_name = parts[1]
-                    table_name = parts[2]
-                    unity.update_table_comment(catalog_name, schema_name, table_name, description)
-                    
-                    # Apply tags if user checked the apply tags checkbox
-                    if item.get('apply_tags'):
-                        tags = {}
-                        
-                        # Debug: Log what tag data we received
-                        logger.info(f"🔍 Tag data for {full_name}: policy_tags={item.get('policy_tags')}, pii_tags={item.get('pii_tags')}, custom_tags={item.get('custom_tags')}")
-                        
-                        # Handle policy_tags (from old system) - manual tags only
-                        if item.get('policy_tags'):
-                            for tag in item['policy_tags']:
-                                if isinstance(tag, str):
-                                    if '.' in tag:
-                                        key, value = tag.split('.', 1)
-                                        tags[key.lower()] = value
-                                    else:
-                                        tags['policy'] = tag
-                        
-                        # Handle pii_tags (from old system) - manual tags only
-                        if item.get('pii_tags'):
-                            for tag in item['pii_tags']:
-                                if isinstance(tag, str):
-                                    if tag.startswith('PII.'):
-                                        tags['classification'] = tag
-                                    else:
-                                        tags['pii'] = tag
-                        
-                        # Handle custom_tags (from new system) - manual tags only
-                        if item.get('custom_tags'):
-                            for tag_pair in item['custom_tags']:
-                                if isinstance(tag_pair, dict) and tag_pair.get('key') and tag_pair.get('value'):
-                                    tags[tag_pair['key']] = tag_pair['value']
-                        
-                        # NOTE: data_classification is NOT applied as a tag - it's informational only
-                        
-                        if tags:
-                            unity.update_tags(catalog_name, schema_name, table_name, tags=tags)
-                            logger.info(f"Applied tags to {full_name}: {tags}")
-                        else:
-                            logger.info(f"No tags to apply for {full_name} (apply_tags=True but no tag data found)")
-                    
-                elif item_type == 'column':
-                    catalog_name = parts[0]
-                    schema_name = parts[1]
-                    table_name = parts[2]
-                    column_name = parts[3]
-                    unity.update_column_comment(catalog_name, schema_name, table_name, column_name, description)
-                    
-                    # Apply tags if user checked the apply tags checkbox (column-level)
-                    if item.get('apply_tags'):
-                        tags = {}
-                        
-                        # Handle policy_tags (from old system) - manual tags only
-                        if item.get('policy_tags'):
-                            for tag in item['policy_tags']:
-                                if isinstance(tag, str):
-                                    if '.' in tag:
-                                        key, value = tag.split('.', 1)
-                                        tags[key.lower()] = value
-                                    else:
-                                        tags['policy'] = tag
-                        
-                        # Handle pii_tags (from old system) - manual tags only
-                        if item.get('pii_tags'):
-                            for tag in item['pii_tags']:
-                                if isinstance(tag, str):
-                                    if tag.startswith('PII.'):
-                                        tags['classification'] = tag
-                                    else:
-                                        tags['pii'] = tag
-                        
-                        # Handle custom_tags (from new system) - manual tags only
-                        if item.get('custom_tags'):
-                            for tag_pair in item['custom_tags']:
-                                if isinstance(tag_pair, dict) and tag_pair.get('key') and tag_pair.get('value'):
-                                    tags[tag_pair['key']] = tag_pair['value']
-                        
-                        # NOTE: data_classification is NOT applied as a tag - it's informational only
-                        
-                        if tags:
-                            unity.update_tags(catalog_name, schema_name, table_name, column_name, tags)
-                            logger.info(f"Applied tags to {full_name}: {tags}")
-                        else:
-                            logger.info(f"No tags to apply for {full_name} (apply_tags=True but no tag data found)")
-                
-                submitted += 1
-                logger.info(f"Successfully submitted metadata for {full_name}")
-                
-                # Record history entry for this successfully submitted item
-                try:
-                    setup_manager = get_setup_manager()
-                    from datetime import datetime
-                    
-                    escaped_comment = item.get('generated_comment', '').replace("'", "''")
-                    timestamp = datetime.now()
-                    run_id = f"commit_{timestamp.strftime('%Y%m%d_%H%M%S')}_{submitted}"
-                    
-                    history_query = f"""
-                        INSERT INTO uc_metadata_assistant.generated_metadata.metadata_results 
-                        (full_name, object_type, proposed_comment, source_model, generation_style, generated_at, run_id, status)
-                        VALUES (
-                            '{item["full_name"]}',
-                            '{item.get("type", "unknown")}',
-                            '{escaped_comment}',
-                            'Manual Commit',
-                            'committed',
-                            current_timestamp(),
-                            '{run_id}',
-                            'committed'
-                        )
-                    """
-                    
-                    # Execute history insert using setup manager's async method
-                    logger.info(f"🔄 Attempting to record commit history for {full_name}")
-                    logger.debug(f"History query: {history_query}")
-                    
-                    future = run_async_in_thread(setup_manager._execute_sql(history_query))
-                    result = future.result(timeout=10)  # Short timeout for insert
-                    
-                    logger.info(f"📝 Successfully recorded commit history for {full_name}")
-                    logger.debug(f"History insert result: {result}")
-                    
-                except Exception as history_error:
-                    logger.error(f"❌ Failed to record history for {full_name}: {history_error}")
-                    logger.error(f"History query was: {history_query}")
-                    import traceback
-                    logger.error(f"Full traceback: {traceback.format_exc()}")
-                
-            except PermissionError as pe:
-                logger.error(f"Permission error submitting {item['full_name']}: {pe}")
-                errors.append(f"{item['full_name']}: {str(pe)}")
-                continue
-            except ValueError as ve:
-                logger.error(f"Validation error submitting {item['full_name']}: {ve}")
-                errors.append(f"{item['full_name']}: {str(ve)}")
-                continue
-            except Exception as e:
-                logger.error(f"Error submitting {item['full_name']}: {e}")
-                errors.append(f"{item['full_name']}: {str(e)}")
-                continue
+        # Initialize commit progress tracking
+        if not hasattr(flask_app, 'commit_tasks'):
+            flask_app.commit_tasks = {}
+        if not hasattr(flask_app, 'commit_progress'):
+            flask_app.commit_progress = {}
         
-        # Determine overall success based on results
-        has_permission_errors = any('Insufficient permissions' in error for error in errors)
-        overall_success = submitted > 0 and not has_permission_errors
+        flask_app.commit_progress[run_id] = {
+            "status": "initializing",
+            "progress": 0,
+            "total_objects": len(items),
+            "processed_objects": 0,
+            "current_phase": "Setup",
+            "current_object": "Starting commit...",
+            "start_time": datetime.now().isoformat(),
+            "estimated_completion": None,
+            "errors": []
+        }
         
-        if has_permission_errors:
-            message = f'Insufficient permissions to perform update. You need USE CATALOG permission on the target catalog.'
-        elif submitted == 0 and len(errors) > 0:
-            message = f'All {len(errors)} items failed to submit. Check permissions and object existence.'
-        elif submitted > 0 and len(errors) > 0:
-            message = f'Partial success: {submitted} items submitted, {len(errors)} failed.'
-        else:
-            message = f'Successfully submitted {submitted} items using canonical COMMENT DDL'
+        # Start commit in background thread
+        commit_future = run_async_in_thread(
+            commit_metadata_with_progress(unity, items, run_id)
+        )
+        
+        flask_app.commit_tasks[run_id] = commit_future
         
         return jsonify({
-            'success': overall_success,
-            'submitted': submitted,
-            'errors': errors,
+            'success': True,
+            'run_id': run_id,
+            'status': 'Commit started',
             'total': len(items),
-            'message': message,
-            'has_permission_errors': has_permission_errors
+            'timestamp': datetime.now().isoformat()
         })
         
     except Exception as e:
         logger.error(f"Error in /api/submit-metadata: {e}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+@flask_app.route("/api/commit/status/<run_id>")
+def commit_status(run_id):
+    """Check status of commit operation with progress tracking"""
+    try:
+        if not hasattr(flask_app, 'commit_tasks'):
+            return jsonify({"error": "No commit tasks found"}), 404
+        
+        future = flask_app.commit_tasks.get(run_id)
+        if not future:
+            return jsonify({"error": "Run ID not found"}), 404
+        
+        # Get progress information
+        progress_info = flask_app.commit_progress.get(run_id, {})
+        
+        if future.done():
+            # Commit completed
+            try:
+                result = future.result()
+                
+                if not result.get('success', False):
+                    return jsonify({
+                        "success": False,
+                        "run_id": run_id,
+                        "status": "FAILED",
+                        "errors": result.get('errors', []),
+                        "submitted": result.get('submitted', 0),
+                        "total": result.get('total', 0),
+                        "timestamp": datetime.now().isoformat()
+                    })
+                else:
+                    return jsonify({
+                        "success": True,
+                        "run_id": run_id,
+                        "status": "COMPLETED",
+                        "submitted": result.get('submitted', 0),
+                        "total": result.get('total', 0),
+                        "errors": result.get('errors', []),
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "run_id": run_id,
+                    "status": "ERROR",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                })
+        else:
+            # Still running - include progress information
+            base_response = {
+                "success": True,
+                "run_id": run_id,
+                "status": "RUNNING",
+                "message": "Committing to Unity Catalog...",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Add progress information if available
+            if progress_info:
+                base_response.update({
+                    "progress": progress_info.get("progress", 0),
+                    "total_objects": progress_info.get("total_objects", 0),
+                    "processed_objects": progress_info.get("processed_objects", 0),
+                    "current_phase": progress_info.get("current_phase", "Committing"),
+                    "current_object": progress_info.get("current_object", ""),
+                    "start_time": progress_info.get("start_time"),
+                    "estimated_completion": progress_info.get("estimated_completion"),
+                    "errors": progress_info.get("errors", [])
+                })
+            
+            return jsonify(base_response)
+            
+    except Exception as e:
+        logger.error(f"Error checking commit status: {e}")
         return jsonify({"error": str(e), "success": False}), 500
 
 @flask_app.route("/api/governed-tags")
@@ -7447,6 +7598,33 @@ td.nowrap{white-space:nowrap}
                   Generate metadata first to see items for review.
                 </p>
               </div>
+              
+              <!-- Commit Status and Progress Bar -->
+              <div id="commit-status" class="group" style="display: none; margin-top: 16px;">
+                <div style="padding: 16px; background: var(--surface-2); border-radius: 8px; color: var(--text-body);">
+                  <div id="commit-status-text">Ready to commit...</div>
+                  
+                  <!-- Commit Progress Bar -->
+                  <div id="commit-progress-container" style="display: none; margin-top: 16px;">
+                    <div class="progress-header">
+                      <div class="progress-phase" id="commit-progress-phase">Committing</div>
+                      <div class="progress-percentage" id="commit-progress-percentage">0%</div>
+                    </div>
+                    
+                    <div class="progress-bar-container">
+                      <div class="progress-bar" id="commit-progress-bar">
+                        <div class="progress-fill" id="commit-progress-fill"></div>
+                      </div>
+                    </div>
+                    
+                    <div class="progress-details">
+                      <div class="progress-current" id="commit-progress-current">Preparing...</div>
+                      <div class="progress-stats" id="commit-progress-stats">0 of 0 objects</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
               <div class="group" style="margin-top: 24px;">
                 <button class="btn" style="background: var(--good); width: 100%;" onclick="submitAllToUnityCatalog()">
                   ✅ Submit All to Unity Catalog
@@ -9916,8 +10094,12 @@ td.nowrap{white-space:nowrap}
 
     const submitBtn = event.target;
     const originalText = submitBtn.textContent;
-    submitBtn.textContent = '⏳ Submitting...';
+    submitBtn.textContent = '⏳ Starting commit...';
     submitBtn.disabled = true;
+    
+    // Get status elements
+    const statusDiv = document.getElementById('commit-status');
+    const statusText = document.getElementById('commit-status-text');
 
     try {
       // Transform items for submission, including tag preferences
@@ -9937,6 +10119,17 @@ td.nowrap{white-space:nowrap}
         };
       });
 
+      // Show status and initialize progress bar
+      if (statusDiv && statusText) {
+        statusDiv.style.display = 'block';
+        statusText.textContent = 'Starting commit for ' + items.length + ' items...';
+        statusDiv.style.background = 'rgba(14, 165, 233, 0.1)';
+        statusDiv.style.borderLeft = '3px solid var(--accent)';
+        
+        // Initialize commit progress bar
+        initializeCommitProgressBar(items.length);
+      }
+
       const response = await fetch('/api/submit-metadata', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -9945,53 +10138,227 @@ td.nowrap{white-space:nowrap}
 
       const result = await response.json();
 
-      if (result.success) {
-        const tagsApplied = items.filter(item => item.apply_tags && item.policy_tags.length > 0).length;
-        let message = `✅ Successfully submitted ${result.submitted} items to Unity Catalog using canonical COMMENT DDL!`;
-        
-        if (tagsApplied > 0) {
-          message += `\n🏷️ Applied policy tags to ${tagsApplied} items.`;
+      if (result.success && result.run_id) {
+        // Start polling commit status with progress tracking
+        if (statusText) {
+          statusText.textContent = 'Commit started! Monitoring progress...';
         }
         
-        alert(message);
+        // Poll for status updates
+        await pollCommitStatus(result.run_id, submitBtn, originalText, items);
         
-        // Clear generated items after successful submission
-        window.generatedItems = [];
-        updateReviewTab();
-        
-        // Clear generation options cache since data has changed
-        clearGenerationOptionsCache(selectedCatalog);
-        
-        // Switch back to overview
-        switchTab('overview');
-        
-        // Refresh metrics
-        updateMetrics();
       } else {
-        // Handle permission errors with specific messaging
-        if (result.has_permission_errors) {
-          alert(`❌ Insufficient permissions to perform update. ${result.message || 'Check catalog permissions.'}`);
-        } else if (result.message) {
-          alert(`❌ Error submitting: ${result.message}`);
-        } else if (result.error) {
-          alert(`❌ Error submitting: ${result.error}`);
-        } else {
-          alert(`❌ Error submitting: Unknown error occurred`);
+        // Handle immediate errors (permission errors, etc.)
+        hideCommitProgressBar();
+        
+        if (statusDiv) {
+          statusDiv.style.background = 'rgba(239, 68, 68, 0.1)';
+          statusDiv.style.borderLeft = '3px solid var(--danger)';
         }
+        
+        let errorMessage = '';
+        if (result.has_permission_errors) {
+          errorMessage = 'Insufficient permissions: ' + (result.message ? result.message : 'Check catalog permissions.');
+        } else if (result.error) {
+          errorMessage = 'Error: ' + result.error;
+        } else if (result.message) {
+          errorMessage = 'Error: ' + result.message;
+        } else {
+          errorMessage = 'Error: Unknown error occurred';
+        }
+        
+        if (statusText) {
+          statusText.textContent = errorMessage;
+        }
+        alert(errorMessage);
         
         if (result.errors && result.errors.length > 0) {
           console.error('Submission errors:', result.errors);
-          // Log specific errors for debugging
-          result.errors.forEach(error => console.error('- ', error));
         }
+        
+        submitBtn.textContent = originalText;
+        submitBtn.disabled = false;
       }
 
     } catch (error) {
       console.error('Error submitting metadata:', error);
-      alert(`❌ Error: ${error.message}`);
-    } finally {
+      hideCommitProgressBar();
+      
+      if (statusDiv) {
+        statusDiv.style.background = 'rgba(239, 68, 68, 0.1)';
+        statusDiv.style.borderLeft = '3px solid var(--danger)';
+      }
+      if (statusText) {
+        statusText.textContent = 'Error: ' + error.message;
+      }
+      
+      alert('Error: ' + error.message);
       submitBtn.textContent = originalText;
       submitBtn.disabled = false;
+    }
+  }
+  
+  // Poll commit status with progress updates
+  async function pollCommitStatus(runId, submitBtn, originalText, items) {
+    const statusDiv = document.getElementById('commit-status');
+    const statusText = document.getElementById('commit-status-text');
+    
+    try {
+      const response = await fetch('/api/commit/status/' + runId);
+      const result = await response.json();
+      
+      if (result.success) {
+        const status = result.status;
+        
+        if (statusDiv && statusText) {
+          statusDiv.style.display = 'block';
+          
+          if (status === 'RUNNING') {
+            // Update progress bar if progress data is available
+            if (result.progress !== undefined) {
+              updateCommitProgressBar(
+                result.progress,
+                result.current_phase,
+                result.current_object,
+                result.processed_objects,
+                result.total_objects
+              );
+              
+              const phase = result.current_phase ? result.current_phase : 'Committing';
+              const obj = result.current_object ? result.current_object : 'Working...';
+              statusText.textContent = phase + ': ' + obj;
+            } else {
+              statusText.textContent = 'Committing to Unity Catalog...';
+            }
+            
+            statusDiv.style.background = 'rgba(14, 165, 233, 0.1)';
+            statusDiv.style.borderLeft = '3px solid var(--accent)';
+            
+            // Continue polling (1 second intervals for commit operations)
+            setTimeout(function() {
+              pollCommitStatus(runId, submitBtn, originalText, items);
+            }, 1000);
+            
+          } else if (status === 'COMPLETED') {
+            // Success! Update progress to 100%
+            const submitted = result.submitted ? result.submitted : 0;
+            const total = result.total ? result.total : 0;
+            updateCommitProgressBar(100, 'Completed', 'All items committed successfully', submitted, total);
+            
+            statusDiv.style.background = 'rgba(34, 197, 94, 0.1)';
+            statusDiv.style.borderLeft = '3px solid var(--good)';
+            
+            // Calculate tags applied
+            const tagsApplied = items.filter(function(item) {
+              return item.apply_tags && item.policy_tags && item.policy_tags.length > 0;
+            }).length;
+            
+            let message = 'Successfully committed ' + submitted + ' items to Unity Catalog using canonical COMMENT DDL!';
+            if (tagsApplied > 0) {
+              message += ' Applied policy tags to ' + tagsApplied + ' items.';
+            }
+            
+            statusText.textContent = message;
+            alert(message);
+            
+            // Cleanup and refresh
+            window.generatedItems = [];
+            updateReviewTab();
+            clearGenerationOptionsCache(selectedCatalog);
+            
+            submitBtn.textContent = originalText;
+            submitBtn.disabled = false;
+            
+            // Hide progress bar and switch tabs after brief delay
+            setTimeout(function() {
+              hideCommitProgressBar();
+              statusDiv.style.display = 'none';
+              switchTab('overview');
+              updateMetrics();
+            }, 2000);
+            
+          } else if (status === 'FAILED' || status === 'ERROR') {
+            // Error!
+            hideCommitProgressBar();
+            
+            statusDiv.style.background = 'rgba(239, 68, 68, 0.1)';
+            statusDiv.style.borderLeft = '3px solid var(--danger)';
+            
+            const errorMsg = 'Commit failed: ' + (result.error ? result.error : 'Unknown error');
+            statusText.textContent = errorMsg;
+            
+            if (result.errors && result.errors.length > 0) {
+              console.error('Commit errors:', result.errors);
+              result.errors.forEach(function(error) {
+                console.error('- ', error);
+              });
+            }
+            
+            alert(errorMsg);
+            
+            submitBtn.textContent = originalText;
+            submitBtn.disabled = false;
+          } else {
+            // Other status
+            statusText.textContent = 'Commit status: ' + status;
+            setTimeout(function() {
+              pollCommitStatus(runId, submitBtn, originalText, items);
+            }, 2000);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error polling commit status:', error);
+      submitBtn.textContent = originalText;
+      submitBtn.disabled = false;
+    }
+  }
+  
+  // Commit progress bar helper functions
+  function initializeCommitProgressBar(totalObjects) {
+    const progressContainer = document.getElementById('commit-progress-container');
+    const progressStats = document.getElementById('commit-progress-stats');
+    
+    if (progressContainer && progressStats) {
+      progressContainer.style.display = 'block';
+      progressStats.textContent = '0 of ' + totalObjects + ' objects';
+      updateCommitProgressBar(0, 'Setup', 'Initializing commit...', 0, totalObjects);
+    }
+  }
+  
+  function updateCommitProgressBar(progress, phase, currentObject, processedObjects, totalObjects) {
+    const progressFill = document.getElementById('commit-progress-fill');
+    const progressPercentage = document.getElementById('commit-progress-percentage');
+    const progressPhase = document.getElementById('commit-progress-phase');
+    const progressCurrent = document.getElementById('commit-progress-current');
+    const progressStats = document.getElementById('commit-progress-stats');
+    
+    if (progressFill) {
+      progressFill.style.width = progress + '%';
+    }
+    
+    if (progressPercentage) {
+      progressPercentage.textContent = progress + '%';
+    }
+    
+    if (progressPhase) {
+      progressPhase.textContent = phase ? phase : 'Committing';
+    }
+    
+    if (progressCurrent) {
+      progressCurrent.textContent = currentObject ? currentObject : 'Working...';
+    }
+    
+    if (progressStats && totalObjects > 0) {
+      const processed = processedObjects ? processedObjects : 0;
+      progressStats.textContent = processed + ' of ' + totalObjects + ' objects';
+    }
+  }
+  
+  function hideCommitProgressBar() {
+    const progressContainer = document.getElementById('commit-progress-container');
+    if (progressContainer) {
+      progressContainer.style.display = 'none';
     }
   }
 
