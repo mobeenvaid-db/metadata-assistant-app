@@ -11129,6 +11129,7 @@ td.nowrap{white-space:nowrap}
   let qualityData = null;
   let qualityDataCache = new Map(); // Cache by catalog name
   let lastQualityCatalog = null;
+  let qualityChartInstances = {}; // Store chart instances for proper cleanup
 
   // Initialize Quality dashboard when tab is clicked
   function initializeQualityDashboard() {
@@ -11399,8 +11400,13 @@ td.nowrap{white-space:nowrap}
     const canvas = document.getElementById(canvasId);
     if (!canvas) return;
     
+    // Destroy existing chart if it exists
+    if (qualityChartInstances[canvasId]) {
+      qualityChartInstances[canvasId].destroy();
+    }
+    
     const ctx = canvas.getContext('2d');
-    new Chart(ctx, {
+    qualityChartInstances[canvasId] = new Chart(ctx, {
       type: 'doughnut',
       data: {
         datasets: [{
@@ -11469,6 +11475,11 @@ td.nowrap{white-space:nowrap}
     const canvas = document.getElementById('trendChart');
     if (!canvas) return;
     
+    // Destroy existing chart if it exists
+    if (qualityChartInstances['trendChart']) {
+      qualityChartInstances['trendChart'].destroy();
+    }
+    
     const ctx = canvas.getContext('2d');
     
     const labels = qualityData.completnessTrend.map(item => {
@@ -11478,7 +11489,7 @@ td.nowrap{white-space:nowrap}
     
     const values = qualityData.completnessTrend.map(item => item.value);
     
-    new Chart(ctx, {
+    qualityChartInstances['trendChart'] = new Chart(ctx, {
       type: 'line',
       data: {
         labels: labels,
@@ -11635,12 +11646,17 @@ td.nowrap{white-space:nowrap}
     const canvas = document.getElementById('riskMatrixChart');
     if (!canvas) return;
     
+    // Destroy existing chart if it exists
+    if (qualityChartInstances['riskMatrixChart']) {
+      qualityChartInstances['riskMatrixChart'].destroy();
+    }
+    
     const ctx = canvas.getContext('2d');
     
     // Process data to handle overlapping points
     const processedData = processOverlappingPoints(qualityData.piiRiskMatrix);
     
-    new Chart(ctx, {
+    qualityChartInstances['riskMatrixChart'] = new Chart(ctx, {
       type: 'scatter',
       data: {
         datasets: [{
@@ -11790,12 +11806,17 @@ td.nowrap{white-space:nowrap}
     const canvas = document.getElementById('confidenceChart');
     if (!canvas) return;
     
+    // Destroy existing chart if it exists
+    if (qualityChartInstances['confidenceChart']) {
+      qualityChartInstances['confidenceChart'].destroy();
+    }
+    
     const ctx = canvas.getContext('2d');
     
     const labels = qualityData.confidenceDistribution.map(item => item.range);
     const data = qualityData.confidenceDistribution.map(item => item.count);
     
-    new Chart(ctx, {
+    qualityChartInstances['confidenceChart'] = new Chart(ctx, {
       type: 'bar',
       data: {
         labels: labels,
@@ -11906,6 +11927,9 @@ td.nowrap{white-space:nowrap}
     if (activeTab) {
       window.previousActiveTab = activeTab.id;
     }
+    
+    // Clear any body attributes from previous tabs (especially Quality tab)
+    document.body.removeAttribute('data-active-tab');
     
     // Hide all tab content
     document.querySelectorAll('.tab-content').forEach(content => {
