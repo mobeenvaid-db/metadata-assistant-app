@@ -56,6 +56,21 @@ class SettingsManager:
                 "tags_enabled": True,
                 "governed_tags_only": False
             },
+            "sampling": {
+                "enable_sampling": True,
+                "sample_rows": 10,  # Default 10 rows for sampling
+                "min_sample_rows": 5,
+                "max_sample_rows": 100,
+                "redact_pii_in_samples": False,  # Default: don't redact PII (LLM needs full context)
+                # Intelligent batch sizing
+                "max_prompt_tokens": 4000,  # Conservative limit for LLM context window
+                "max_batch_schemas": 15,
+                "max_batch_tables": 10,
+                "max_batch_columns": 20,
+                "estimated_tokens_per_schema": 150,  # Rough estimate including context
+                "estimated_tokens_per_table": 300,   # Includes columns and samples
+                "estimated_tokens_per_column": 100   # Includes samples and context
+            },
             "metadata": {
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
@@ -294,6 +309,21 @@ class SettingsManager:
         """Update tags policy configuration"""
         settings = self.get_settings() or self.default_settings.copy()
         settings['tags_policy'].update(tags_policy)
+        self.save_settings(settings)
+    
+    def get_sampling_config(self) -> Dict:
+        """Get sampling configuration"""
+        settings = self.get_settings()
+        if settings:
+            return settings.get('sampling', self.default_settings['sampling'])
+        return self.default_settings['sampling']
+    
+    def update_sampling_config(self, sampling_config: Dict):
+        """Update sampling configuration"""
+        settings = self.get_settings() or self.default_settings.copy()
+        if 'sampling' not in settings:
+            settings['sampling'] = self.default_settings['sampling'].copy()
+        settings['sampling'].update(sampling_config)
         self.save_settings(settings)
     
     def get_default_settings(self) -> Dict:

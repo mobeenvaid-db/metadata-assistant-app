@@ -5520,17 +5520,22 @@ def run_enhanced_generation():
         # Start enhanced generation in background thread
         enhanced_generator = get_enhanced_generator()
         
-        # Update configuration based on request
+        # Update configuration based on request (only if explicitly provided)
+        # Note: Settings are already loaded during generator initialization, 
+        # so we only override if the request explicitly provides these values
         config_updates = {}
         if body.get("sample_rows"):
-            config_updates['sample_rows'] = int(body.get("sample_rows", 50))
+            config_updates['sample_rows'] = int(body.get("sample_rows"))  # No fallback - use settings default
         if body.get("chunk_size"):
-            config_updates['max_chunk_size'] = int(body.get("chunk_size", 10))
+            config_updates['max_chunk_size'] = int(body.get("chunk_size"))  # No fallback - use settings default
         if body.get("temperature"):
-            config_updates['temperature'] = float(body.get("temperature", 0.3))
+            config_updates['temperature'] = float(body.get("temperature"))  # No fallback - use settings default
         
         if config_updates:
+            logger.info(f"🔧 Overriding config from request: {config_updates}")
             enhanced_generator.update_config(**config_updates)
+        else:
+            logger.info(f"📋 Using settings-based config: sample_rows={enhanced_generator.config.get('sample_rows')}, enable_sampling={enhanced_generator.config.get('enable_sampling')}")
         
         # Generate run ID first
         run_id = f"enhanced_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{catalog}"
@@ -7502,7 +7507,7 @@ td.nowrap{white-space:nowrap}
                       </div>
                     </div>
                     <select class="select" id="schema-selection" multiple style="height: 80px; width: 100%;">
-                      <option disabled>Select a catalog first...</option>
+                      <option disabled>Select a catalog and click Generate tab...</option>
                     </select>
                   </div>
 
@@ -7692,8 +7697,9 @@ td.nowrap{white-space:nowrap}
           <!-- Settings Tabs -->
           <div class="settings-tabs">
             <button class="settings-tab active" onclick="switchSettingsTab('models')">🤖 Models</button>
-            <button class="settings-tab" onclick="switchSettingsTab('pii')">🔍 PII Detection</button>
+            <button class="settings-tab" onclick="switchSettingsTab('pii')">🔒 Sensitive Data</button>
             <button class="settings-tab" onclick="switchSettingsTab('tags')">🏷️ Tags Policy</button>
+            <button class="settings-tab" onclick="switchSettingsTab('sampling')">📊 Sampling</button>
           </div>
 
           <!-- Settings Tab Content -->
@@ -7748,14 +7754,14 @@ td.nowrap{white-space:nowrap}
             <div id="pii-settings" class="settings-tab-pane">
               <div class="settings-section">
                 <div class="section-header">
-                  <h2>PII Analysis Configuration</h2>
-                  <p>Configure how sensitive data is detected and classified during metadata generation</p>
+                  <h2>Regulatory & Sensitive Data Detection</h2>
+                  <p>Configure detection of regulated data across all compliance frameworks (PII, PHI, PCI, Financial, Biometric)</p>
                 </div>
                 <div class="section-content">
                   <div class="pii-toggle" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding: 16px; border: 1px solid var(--border); border-radius: 8px;">
                     <div>
-                      <div style="font-weight: 500; margin-bottom: 4px;">Enable PII Analysis</div>
-                      <p style="margin: 0; color: var(--text-muted); font-size: 14px;">Scan columns for sensitive data during metadata generation and assign data classifications (PUBLIC, PII, PHI, etc.). Uses pattern matching enhanced with AI analysis when enabled below.</p>
+                      <div style="font-weight: 500; margin-bottom: 4px;">Enable Regulatory & Sensitive Data Detection</div>
+                      <p style="margin: 0; color: var(--text-muted); font-size: 14px;">Scan columns for regulated and sensitive data during metadata generation. Detects PII (GDPR/CCPA), PHI (HIPAA), PCI (Payment Card), Financial (SOX/GLBA), Biometric, and Confidential data. Uses pattern matching enhanced with AI analysis when enabled below.</p>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">
                       <span class="model-status enabled" id="pii-main-status">Enabled</span>
@@ -7843,6 +7849,242 @@ td.nowrap{white-space:nowrap}
                 </div>
               </div>
             </div>
+
+            <!-- Sampling Tab -->
+            <div id="sampling-settings" class="settings-tab-pane">
+              <div class="settings-section">
+                <div class="section-header">
+                  <h2>Data Sampling Configuration</h2>
+                  <p>Configure how many rows are sampled from tables for PII detection and metadata analysis</p>
+                </div>
+                <div class="section-content">
+                  <div class="policy-option" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding: 16px; border: 1px solid var(--border); border-radius: 8px;">
+                    <div>
+                      <div style="font-weight: 500; margin-bottom: 4px;">Enable Data Sampling</div>
+                      <p class="option-description" style="margin: 0; color: var(--text-muted); font-size: 14px;">Sample actual table data for enhanced PII detection and context analysis. Disable if you only want schema-level metadata.</p>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                      <span class="model-status enabled" id="sampling-enabled-status">Enabled</span>
+                      <label class="toggle-switch">
+                        <input type="checkbox" id="sampling-enabled" checked onchange="updateSamplingConfig('enable_sampling', this.checked)">
+                        <span class="slider"></span>
+                      </label>
+                    </div>
+                  </div>
+                  
+                  <div class="policy-option" style="margin-bottom: 20px; padding: 16px; border: 1px solid var(--border); border-radius: 8px;">
+                    <div style="margin-bottom: 12px;">
+                      <div style="font-weight: 500; margin-bottom: 4px;">Sample Size</div>
+                      <p class="option-description" style="margin: 0; color: var(--text-muted); font-size: 14px;">Number of rows to sample from each table (range: 5-100). Smaller values are faster but may miss PII patterns.</p>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 16px;">
+                      <input type="range" id="sample-rows-slider" min="5" max="100" value="10" step="5" 
+                             style="flex: 1; min-width: 200px;" 
+                             oninput="updateSamplingSlider(this.value)">
+                      <input type="number" id="sample-rows-input" min="5" max="100" value="10" 
+                             style="width: 80px; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);"
+                             onchange="updateSamplingConfig('sample_rows', parseInt(this.value))">
+                      <span style="color: var(--text-muted); font-size: 14px;">rows</span>
+                    </div>
+                    <div style="margin-top: 12px; padding: 12px; background: var(--surface-2); border-radius: 4px;">
+                      <div style="font-size: 13px; color: var(--text-muted);">
+                        <strong style="color: var(--text);">Performance Impact:</strong>
+                        <ul style="margin: 8px 0 0 20px; padding: 0;">
+                          <li>5-15 rows: Very fast, basic PII detection</li>
+                          <li>15-30 rows: Fast, suitable for most use cases</li>
+                          <li>30-50 rows: Balanced approach, better PII coverage</li>
+                          <li>50-100 rows: Thorough analysis, slower for large tables</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div class="policy-option" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding: 16px; border: 1px solid var(--border); border-radius: 8px;">
+                    <div>
+                      <div style="font-weight: 500; margin-bottom: 4px;">Redact PII in Sample Context</div>
+                      <p class="option-description" style="margin: 0; color: var(--text-muted); font-size: 14px;">Replace detected PII values with &lt;REDACTED&gt; before sending to LLM. May reduce metadata quality but increases privacy. Only applies when sampling is enabled.</p>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                      <span class="model-status disabled" id="redact-pii-status">Disabled</span>
+                      <label class="toggle-switch">
+                        <input type="checkbox" id="redact-pii-enabled" onchange="updateSamplingConfig('redact_pii_in_samples', this.checked)">
+                        <span class="slider"></span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div style="padding: 16px; background: var(--surface-2); border-radius: 8px; border-left: 4px solid var(--accent-warm);">
+                    <div style="font-weight: 500; margin-bottom: 8px;">ℹ️ How Sampling Works</div>
+                    <p style="margin: 0; color: var(--text-muted); font-size: 14px; line-height: 1.6;">
+                      When generating metadata for tables, the app samples N rows using <code style="background: var(--surface); padding: 2px 6px; border-radius: 3px;">SELECT * FROM table LIMIT N</code>. 
+                      This sample data is analyzed for PII patterns (SSN, email, phone, etc.) and optionally provides context to the LLM for better description quality. 
+                      Sampling is performed per-table during generation and does not persist the data.
+                    </p>
+                  </div>
+
+                  <!-- Intelligent Batch Sizing Configuration -->
+                  <div style="margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--border);">
+                    <h3 style="margin: 0 0 16px 0; font-size: 16px; font-weight: 600;">⚡ Intelligent Batch Sizing</h3>
+                    <p style="margin: 0 0 16px 0; color: var(--text-muted); font-size: 14px;">
+                      Control how the app batches objects when generating metadata. Larger batches are faster but use more LLM context tokens. 
+                      The app automatically splits large selections and validates token limits.
+                    </p>
+
+                    <!-- Max Prompt Tokens -->
+                    <div style="margin-bottom: 20px;">
+                      <label style="display: block; margin-bottom: 8px; font-weight: 500;">Max Prompt Tokens</label>
+                      <p style="margin: 0 0 8px 0; color: var(--text-muted); font-size: 13px;">Maximum tokens allowed per LLM call (4000 = conservative, 8000 = larger models)</p>
+                      <input type="number" id="max-prompt-tokens-input" 
+                             style="width: 120px; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);"
+                             value="4000" min="2000" max="16000" step="1000"
+                             onchange="updateSamplingConfig('max_prompt_tokens', parseInt(this.value))">
+                      <span style="margin-left: 8px; color: var(--text-muted); font-size: 13px;">tokens</span>
+                    </div>
+
+                    <!-- Batch Sizes -->
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px;">
+                      <div>
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">Max Schemas/Batch</label>
+                        <input type="number" id="max-batch-schemas-input" 
+                               style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);"
+                               value="15" min="1" max="50" step="1"
+                               onchange="updateSamplingConfig('max_batch_schemas', parseInt(this.value))">
+                      </div>
+                      <div>
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">Max Tables/Batch</label>
+                        <input type="number" id="max-batch-tables-input" 
+                               style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);"
+                               value="10" min="1" max="30" step="1"
+                               onchange="updateSamplingConfig('max_batch_tables', parseInt(this.value))">
+                      </div>
+                      <div>
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">Max Columns/Batch</label>
+                        <input type="number" id="max-batch-columns-input" 
+                               style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);"
+                               value="20" min="1" max="50" step="1"
+                               onchange="updateSamplingConfig('max_batch_columns', parseInt(this.value))">
+                      </div>
+                    </div>
+
+                    <!-- Token Estimates (Advanced) -->
+                    <details style="margin-top: 16px; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px;">
+                      <summary style="cursor: pointer; font-weight: 500; user-select: none;">🔧 Advanced: Token Estimates</summary>
+                      <div style="margin-top: 12px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;">
+                        <div>
+                          <label style="display: block; margin-bottom: 8px; font-size: 13px;">Tokens/Schema</label>
+                          <input type="number" id="estimated-tokens-schema-input" 
+                                 style="width: 100%; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-2); color: var(--text); font-size: 13px;"
+                                 value="150" min="50" max="500" step="50"
+                                 onchange="updateSamplingConfig('estimated_tokens_per_schema', parseInt(this.value))">
+                        </div>
+                        <div>
+                          <label style="display: block; margin-bottom: 8px; font-size: 13px;">Tokens/Table</label>
+                          <input type="number" id="estimated-tokens-table-input" 
+                                 style="width: 100%; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-2); color: var(--text); font-size: 13px;"
+                                 value="300" min="100" max="1000" step="50"
+                                 onchange="updateSamplingConfig('estimated_tokens_per_table', parseInt(this.value))">
+                        </div>
+                        <div>
+                          <label style="display: block; margin-bottom: 8px; font-size: 13px;">Tokens/Column</label>
+                          <input type="number" id="estimated-tokens-column-input" 
+                                 style="width: 100%; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-2); color: var(--text); font-size: 13px;"
+                                 value="100" min="50" max="500" step="25"
+                                 onchange="updateSamplingConfig('estimated_tokens_per_column', parseInt(this.value))">
+                        </div>
+                      </div>
+                      <p style="margin: 12px 0 0 0; color: var(--text-muted); font-size: 12px;">
+                        ℹ️ These estimates help calculate optimal batch sizes. Adjust if you notice prompts being too large or small.
+                      </p>
+                    </details>
+
+                    <!-- Quick Presets -->
+                    <div style="margin-top: 20px; padding: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;">
+                      <h4 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">⚡ Quick Presets</h4>
+                      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;">
+                        <button onclick="applyBatchPreset('conservative')" 
+                                style="padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; transition: all 0.2s;">
+                          <div style="font-weight: 600; margin-bottom: 4px; color: var(--good);">🐢 Conservative</div>
+                          <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">
+                            Safest settings<br>
+                            Lower cost<br>
+                            Slower speed
+                          </div>
+                        </button>
+                        <button onclick="applyBatchPreset('balanced')" 
+                                style="padding: 12px; background: var(--surface-2); border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; text-align: left; transition: all 0.2s;">
+                          <div style="font-weight: 600; margin-bottom: 4px; color: var(--accent);">⚖️ Balanced</div>
+                          <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">
+                            Recommended<br>
+                            Good cost/speed<br>
+                            Works for most
+                          </div>
+                        </button>
+                        <button onclick="applyBatchPreset('aggressive')" 
+                                style="padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; transition: all 0.2s;">
+                          <div style="font-weight: 600; margin-bottom: 4px; color: var(--warning);">🚀 Aggressive</div>
+                          <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">
+                            Fastest speed<br>
+                            Higher cost<br>
+                            Large context LLMs
+                          </div>
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Cost/Performance Calculator -->
+                    <div style="margin-top: 20px; padding: 16px; background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(168, 85, 247, 0.1) 100%); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px;">
+                      <h4 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">📊 Estimate for 1000 Objects</h4>
+                      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div>
+                          <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">Object Type:</label>
+                          <select id="estimate-object-type" onchange="updateBatchEstimate()" 
+                                  style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);">
+                            <option value="schema">Schemas</option>
+                            <option value="table" selected>Tables</option>
+                            <option value="column">Columns</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">Quantity:</label>
+                          <input type="number" id="estimate-quantity" value="1000" min="1" max="10000" step="100" onchange="updateBatchEstimate()"
+                                 style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text);">
+                        </div>
+                      </div>
+                      <div style="margin-top: 16px; padding: 12px; background: var(--surface); border-radius: 6px;">
+                        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; text-align: center;">
+                          <div>
+                            <div style="font-size: 24px; font-weight: 700; color: var(--accent);" id="estimate-api-calls">--</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">API Calls</div>
+                          </div>
+                          <div>
+                            <div style="font-size: 24px; font-weight: 700; color: var(--good);" id="estimate-time">--</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Est. Time</div>
+                          </div>
+                          <div>
+                            <div style="font-size: 24px; font-weight: 700; color: var(--warning);" id="estimate-cost">--</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Est. Cost</div>
+                          </div>
+                        </div>
+                        <div style="margin-top: 12px; padding: 8px; background: var(--surface-2); border-radius: 4px; font-size: 12px; color: var(--text-muted); text-align: center;">
+                          <span id="estimate-recommendation">Adjust settings above to see estimates</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style="margin-top: 16px; padding: 12px; background: var(--info-bg, rgba(66, 153, 225, 0.1)); border-radius: 6px; border-left: 3px solid var(--info, #4299e1);">
+                      <div style="font-weight: 500; margin-bottom: 4px; color: var(--info, #4299e1);">💡 How to Choose Settings</div>
+                      <ul style="margin: 8px 0 0 0; padding-left: 20px; color: var(--text-muted); font-size: 13px; line-height: 1.5;">
+                        <li><strong>Cost-Sensitive:</strong> Use Conservative preset (more API calls, but each call is cheaper)</li>
+                        <li><strong>Speed-Focused:</strong> Use Aggressive preset (fewer calls = faster, needs larger LLM context)</li>
+                        <li><strong>Balanced:</strong> Use Balanced preset (recommended for most use cases)</li>
+                        <li><strong>Complex Tables:</strong> Reduce "Max Tables/Batch" if tables have 30+ columns</li>
+                        <li><strong>Large Context Models:</strong> Increase "Max Prompt Tokens" to 8000+ for GPT-4/Claude</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -7887,8 +8129,8 @@ td.nowrap{white-space:nowrap}
             <div class="numeric-tile">
               <div class="tile-icon">⚠️</div>
               <div class="tile-content">
-                <h3 class="tile-title">PII Exposure</h3>
-              <p class="tile-description">Number of high-risk PII fields detected by pattern and AI analysis</p>
+                <h3 class="tile-title">Sensitive Data Exposure</h3>
+              <p class="tile-description">High-risk regulated fields detected (PII, PHI, PCI, Financial, Biometric)</p>
                 <p class="tile-value" id="pii-exposure-value">-- High-Risk Fields</p>
               </div>
             </div>
@@ -7940,8 +8182,8 @@ td.nowrap{white-space:nowrap}
               </div>
             </div>
             <div class="analysis-card">
-              <h3 class="card-title">PII Risk Matrix</h3>
-              <p class="chart-description">PII fields plotted by sensitivity level vs documentation quality with overlap handling</p>
+              <h3 class="card-title">Sensitive Data Risk Matrix</h3>
+              <p class="chart-description">Regulated fields (PII, PHI, PCI, Financial) plotted by sensitivity level vs documentation quality</p>
               <div class="chart-container" style="position: relative; height: 300px;">
                 <canvas id="riskMatrixChart"></canvas>
               </div>
@@ -7971,17 +8213,30 @@ td.nowrap{white-space:nowrap}
       const catalogs = await r.json();
       const dd = document.getElementById('catalog-dd');
       dd.innerHTML = '';
+      
+      // Add placeholder option
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Select a catalog';
+      placeholder.selected = true;
+      placeholder.disabled = true;
+      dd.appendChild(placeholder);
+      
+      // Add catalog options
       catalogs.forEach(c=>{
-        const o = document.createElement('option'); o.textContent = c.name || 'catalog';
+        const o = document.createElement('option');
+        o.value = c.name || '';
+        o.textContent = c.name || 'catalog';
         dd.appendChild(o);
       });
+      
       if(!catalogs.length){
-        const o = document.createElement('option'); o.textContent = 'Catalog';
-        dd.appendChild(o);
+        // If no catalogs, show message instead of placeholder
+        dd.innerHTML = '<option value="" disabled selected>No catalogs available</option>';
       }
     }catch(e){
       const dd = document.getElementById('catalog-dd');
-      dd.innerHTML = '<option>Catalog</option>';
+      dd.innerHTML = '<option value="" disabled selected>Error loading catalogs</option>';
     }
   })();
 
@@ -8491,8 +8746,8 @@ td.nowrap{white-space:nowrap}
       catalog: selectedCatalog
     };
     
-    // Store in localStorage
-    localStorage.setItem('uc_metadata_filter', JSON.stringify(currentFilter));
+    // Store in sessionStorage (clears when browser tab closes)
+    sessionStorage.setItem('uc_metadata_filter', JSON.stringify(currentFilter));
     window.activeFilter = currentFilter;
     
     // Show feedback
@@ -8522,8 +8777,8 @@ td.nowrap{white-space:nowrap}
 
   // Unsave/clear current filter
   function unsaveCurrentFilter() {
-    // Clear localStorage
-    localStorage.removeItem('uc_metadata_filter');
+    // Clear sessionStorage
+    sessionStorage.removeItem('uc_metadata_filter');
     window.activeFilter = null;
     
     // Reset filter UI
@@ -9075,9 +9330,8 @@ td.nowrap{white-space:nowrap}
           catalog: selectedCatalog,
           model: currentModel,
           style: 'enterprise',
-          sample_rows: 50,
-          chunk_size: 10,
-          temperature: 0.3,
+          // sample_rows, chunk_size, temperature are read from Settings by the backend
+          // Only send these if you want to override settings (we don't - use settings)
           // Add selected objects scope
           selected_objects: selectedObjects
         })
@@ -9376,11 +9630,60 @@ td.nowrap{white-space:nowrap}
     console.warn('importEnhancedResults() is deprecated - use the combined Generate & Review workflow');
   }
 
+  // Cache for models list to avoid repeated fetches
+  let cachedModels = null;
+  let modelsCacheTimestamp = null;
+  const MODELS_CACHE_TTL = 300000; // 5 minutes
+
   // Load models for Generate tab dropdown
-  async function loadGenerateModels() {
+  async function loadGenerateModels(forceRefresh = false) {
     try {
+      // Check cache first
+      const now = Date.now();
+      if (!forceRefresh && cachedModels && modelsCacheTimestamp && (now - modelsCacheTimestamp < MODELS_CACHE_TTL)) {
+        console.log('Using cached models list');
+        const data = cachedModels;
+        // Render from cache (skip to rendering logic below)
+        if (data.status === 'success' && data.models) {
+          const modelSelect = document.getElementById('gen-model-select');
+          if (!modelSelect) return;
+          
+          modelSelect.innerHTML = '';
+          const modelEntries = Object.entries(data.models);
+          if (modelEntries.length === 0) {
+            modelSelect.innerHTML = '<option value="">No models available</option>';
+            return;
+          }
+          
+          modelEntries.forEach(function(entry) {
+            const modelId = entry[0];
+            const modelInfo = entry[1];
+            const option = document.createElement('option');
+            option.value = modelId;
+            option.textContent = modelInfo.name + ' (' + modelInfo.description + ')';
+            modelSelect.appendChild(option);
+          });
+          
+          if (data.default_model && data.models[data.default_model]) {
+            modelSelect.value = data.default_model;
+            currentModel = data.default_model;
+          } else if (modelEntries.length > 0) {
+            modelSelect.value = modelEntries[0][0];
+            currentModel = modelEntries[0][0];
+          }
+          
+          console.log('Loaded ' + modelEntries.length + ' models from cache');
+        }
+        return;
+      }
+      
+      // Fetch from API
       const response = await fetch('/api/models');
       const data = await response.json();
+      
+      // Cache the result
+      cachedModels = data;
+      modelsCacheTimestamp = Date.now();
       
       if (data.status === 'success' && data.models) {
         const modelSelect = document.getElementById('gen-model-select');
@@ -9430,11 +9733,65 @@ td.nowrap{white-space:nowrap}
     }
   }
 
-  // Update model when Generate tab dropdown changes
+  // Debounce helper to prevent security extension interference
+  function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        clearTimeout(timeout);
+        func(...args);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+    };
+  }
+
+  // Update model when Generate tab dropdown changes (debounced to prevent security extension freezing)
+  const handleModelChange = debounce((value) => {
+    // Use requestAnimationFrame to defer execution and avoid blocking UI
+    requestAnimationFrame(() => {
+      currentModel = value;
+      console.log('Model changed to:', currentModel);
+    });
+  }, 300);
+  
   document.getElementById('gen-model-select').addEventListener('change', e => {
-    currentModel = e.target.value;
-    console.log('Model changed to:', currentModel);
-  });
+    handleModelChange(e.target.value);
+  }, { passive: true });
+
+  // Style change handler with async/debounce to prevent security extension freezing
+  const styleDescriptions = {
+    'concise': 'Clear and concise descriptions that get straight to the point. Best for quick documentation.',
+    'technical': 'Detailed technical descriptions with terminology suited for data engineers and analysts.',
+    'business': 'Business-focused descriptions that explain value and use cases for stakeholders.'
+  };
+
+  function setActiveStyle(style, element) {
+    // Use requestAnimationFrame to defer UI updates
+    requestAnimationFrame(() => {
+      // Update active pill styling
+      document.querySelectorAll('.pill').forEach(pill => {
+        pill.classList.remove('active');
+      });
+      element.classList.add('active');
+      
+      // Update global style variable
+      currentStyle = style;
+      
+      // Update description text asynchronously
+      setTimeout(() => {
+        const descText = document.getElementById('style-description-text');
+        if (descText && styleDescriptions[style]) {
+          descText.textContent = styleDescriptions[style];
+        }
+      }, 0);
+      
+      console.log('Style changed to:', style);
+    });
+  }
+  
+  // Expose to global scope
+  window.setActiveStyle = setActiveStyle;
 
   // Update catalog and metrics when catalog changes
   document.getElementById('catalog-dd').addEventListener('change', async e => {
@@ -9679,8 +10036,11 @@ td.nowrap{white-space:nowrap}
     refreshProposedTags(itemIndex);
   }
 
-  // Legacy function - kept for backward compatibility but not used in new UI
+  // DEPRECATED: Legacy prompt-based tag addition
+  // This function is no longer used - replaced by showAddTagForm() with dropdown UI
+  // Kept only for reference, should not be called anywhere
   function addProposedTag(itemIndex) {
+    console.warn('⚠️ DEPRECATED: addProposedTag() should not be used. Use showAddTagForm() instead.');
     const newTag = prompt('Enter new policy tag (e.g., "PII.Personal", "classification.RESTRICTED"):');
     if (!newTag || !newTag.trim()) return;
     
@@ -9987,7 +10347,7 @@ td.nowrap{white-space:nowrap}
     cancelNewTag(itemIndex);
   }
 
-  function refreshProposedTags(itemIndex) {
+  async function refreshProposedTags(itemIndex) {
     const item = window.generatedItems[itemIndex];
     const tagsContainer = document.getElementById(`proposed-tags-${itemIndex}`);
     
@@ -9995,7 +10355,18 @@ td.nowrap{white-space:nowrap}
     
     const proposedTags = item.proposed_policy_tags || [];
     
-    // Rebuild the tags HTML
+    // Get tags policy to check if manual tags are allowed
+    let tagsPolicy = { tags_enabled: true, governed_tags_only: false };
+    try {
+      const policyResponse = await fetch('/api/settings/tags-policy');
+      if (policyResponse.ok) {
+        tagsPolicy = await policyResponse.json();
+      }
+    } catch (e) {
+      console.warn('Could not fetch tags policy, using defaults');
+    }
+    
+    // Rebuild the tags HTML with inline form (matching initial render)
     tagsContainer.innerHTML = `
       ${proposedTags.map((tagObj, tagIndex) => `
         <span style="background: rgba(245, 158, 11, 0.15); color: var(--warning); padding: 2px 6px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-flex; align-items: center; gap: 4px;">
@@ -10003,7 +10374,38 @@ td.nowrap{white-space:nowrap}
           <button onclick="removeProposedTag(${itemIndex}, ${tagIndex})" style="background: none; border: none; color: var(--warning); cursor: pointer; font-size: 10px; padding: 0; width: 12px; height: 12px; display: flex; align-items: center; justify-content: center;">×</button>
         </span>
       `).join('')}
-      <button onclick="addProposedTag(${itemIndex})" style="background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px dashed var(--warning); padding: 2px 6px; border-radius: 4px; font-size: 11px; margin: 2px; cursor: pointer;">+ Add Tag</button>
+      <div id="add-tag-form-${itemIndex}" style="display: none; margin-top: 8px; padding: 8px; background: var(--surface-2); border-radius: 4px; border: 1px solid var(--border);">
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+          <!-- Tag Key Selection -->
+          <select id="tag-key-select-${itemIndex}" class="tag-key-select" data-index="${itemIndex}" 
+                  style="flex: 1; min-width: 120px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 12px;">
+            <option value="">Select tag key...</option>
+            <option value="__loading__">🔄 Loading governed tags...</option>
+          </select>
+          
+          <!-- Tag Value Selection (dynamic based on key) -->
+          <select id="tag-value-select-${itemIndex}" class="tag-value-select" data-index="${itemIndex}" 
+                  style="flex: 1; min-width: 120px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 12px;" disabled>
+            <option value="">Select value...</option>
+          </select>
+          
+          <!-- Manual Key Input (hidden by default, only shown if manual tags allowed) -->
+          ${!tagsPolicy.governed_tags_only ? `
+          <input type="text" id="tag-key-manual-${itemIndex}" placeholder="Custom key" 
+                 style="flex: 1; min-width: 120px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 12px; display: none;">
+          ` : ''}
+          
+          <!-- Manual Value Input (for non-governed tags, only shown if manual tags allowed) -->
+          ${!tagsPolicy.governed_tags_only ? `
+          <input type="text" id="tag-value-manual-${itemIndex}" placeholder="Custom value" 
+                 style="flex: 1; min-width: 120px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 12px; display: none;">
+          ` : ''}
+          
+          <button class="save-tag-btn" data-index="${itemIndex}" style="background: var(--good); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">Save</button>
+          <button class="cancel-tag-btn" data-index="${itemIndex}" style="background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">Cancel</button>
+        </div>
+      </div>
+      <button id="add-tag-btn-${itemIndex}" class="show-tag-form-btn" data-index="${itemIndex}" style="background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px dashed var(--warning); padding: 2px 6px; border-radius: 4px; font-size: 11px; margin: 2px; cursor: pointer;">+ Add Tag</button>
     `;
   }
 
@@ -10265,6 +10667,7 @@ td.nowrap{white-space:nowrap}
             window.generatedItems = [];
             updateReviewTab();
             clearGenerationOptionsCache(selectedCatalog);
+            clearHistoryCache(selectedCatalog); // Clear history cache to show new updates
             
             submitBtn.textContent = originalText;
             submitBtn.disabled = false;
@@ -10405,9 +10808,6 @@ td.nowrap{white-space:nowrap}
         const itemIndex = parseInt(e.target.getAttribute('data-item-index'));
         const tagKey = e.target.getAttribute('data-tag-key');
         removeCustomTagFromReview(itemIndex, tagKey);
-      } else if (e.target.classList.contains('add-tag-btn')) {
-        const itemIndex = parseInt(e.target.getAttribute('data-index'));
-        addProposedTag(itemIndex);
       } else if (e.target.classList.contains('show-tag-form-btn')) {
         const itemIndex = parseInt(e.target.getAttribute('data-index'));
         showAddTagForm(itemIndex);
@@ -10496,10 +10896,10 @@ td.nowrap{white-space:nowrap}
     restoreSavedFilter();
   });
 
-  // Restore saved filter from localStorage (only UI state, not active filter)
+  // Restore saved filter from sessionStorage (only UI state, not active filter)
   function restoreSavedFilter() {
     try {
-      const savedFilter = localStorage.getItem('uc_metadata_filter');
+      const savedFilter = sessionStorage.getItem('uc_metadata_filter');
       if (savedFilter) {
         const filter = JSON.parse(savedFilter);
         
@@ -10537,12 +10937,52 @@ td.nowrap{white-space:nowrap}
   // Activate saved filter when catalog is selected
   function activateSavedFilterIfExists() {
     try {
-      const savedFilter = localStorage.getItem('uc_metadata_filter');
+      const savedFilter = sessionStorage.getItem('uc_metadata_filter');
       if (savedFilter) {
         const filter = JSON.parse(savedFilter);
         // Only activate if the catalog matches
         if (filter.catalog === selectedCatalog) {
           window.activeFilter = filter;
+          
+          // Update UI controls to reflect the loaded filter
+          // 1. Set object type pills (schemas/tables/columns)
+          document.querySelectorAll('[data-filter]').forEach(pill => {
+            if (pill.dataset.filter === filter.type) {
+              pill.classList.add('active');
+            } else {
+              pill.classList.remove('active');
+            }
+          });
+          
+          // Update currentFilter to match the saved filter
+          window.currentFilter = filter.type;
+          
+          // 2. Set data objects dropdown (after it's populated)
+          const dataObjectsFilter = document.getElementById('data-objects-filter');
+          if (dataObjectsFilter && filter.object) {
+            // The dropdown will be populated by updateDataObjectsDropdown
+            // Just set the value once options are loaded
+            setTimeout(() => {
+              dataObjectsFilter.value = filter.object;
+            }, 500);
+          }
+          
+          // 3. Set owner filter dropdown
+          const ownerFilter = document.getElementById('owner-filter');
+          if (ownerFilter && filter.owner) {
+            setTimeout(() => {
+              ownerFilter.value = filter.owner;
+            }, 500);
+          }
+          
+          // 4. Show filter status badge and "Clear Filter" button
+          showFilterStatus(filter);
+          const unsaveBtn = document.getElementById('unsave-filter-btn');
+          if (unsaveBtn) {
+            unsaveBtn.style.display = 'block';
+          }
+          
+          console.log('✅ Restored saved filter from localStorage:', filter);
           return true;
         } else {
           return false;
@@ -10562,8 +11002,8 @@ td.nowrap{white-space:nowrap}
     if (!catalogName) {
       // Reset all dropdowns
       document.getElementById('schema-selection').innerHTML = '<option disabled>Select a catalog first...</option>';
-      document.getElementById('table-selection').innerHTML = '<option disabled>Select a catalog first...</option>';
-      document.getElementById('column-selection').innerHTML = '<option disabled>Select a catalog first...</option>';
+      document.getElementById('table-selection').innerHTML = '<option disabled>Select schemas first...</option>';
+      document.getElementById('column-selection').innerHTML = '<option disabled>Select tables first...</option>';
       return;
     }
 
@@ -10583,6 +11023,11 @@ td.nowrap{white-space:nowrap}
     }
 
     try {
+      // Show loading states before fetching data
+      document.getElementById('schema-selection').innerHTML = '<option disabled>⏳ Loading schemas...</option>';
+      document.getElementById('table-selection').innerHTML = '<option disabled>⏳ Loading tables...</option>';
+      document.getElementById('column-selection').innerHTML = '<option disabled>⏳ Loading columns...</option>';
+      
       // Load fresh data and cache it
       console.log('🔄 Loading fresh generation options for catalog:', catalogName);
       
@@ -10605,6 +11050,10 @@ td.nowrap{white-space:nowrap}
       
     } catch (error) {
       console.error('Error populating generation selections:', error);
+      // Show error state in dropdowns
+      document.getElementById('schema-selection').innerHTML = '<option disabled>❌ Error loading schemas</option>';
+      document.getElementById('table-selection').innerHTML = '<option disabled>❌ Error loading tables</option>';
+      document.getElementById('column-selection').innerHTML = '<option disabled>❌ Error loading columns</option>';
     }
   }
   
@@ -10920,16 +11369,35 @@ td.nowrap{white-space:nowrap}
   // History tab functions
   let currentHistoryDays = 7; // Default to 7 days
   
-  async function updateMetadataHistory() {
+  // Cache for history data to prevent reloading on tab switches
+  window.historyCache = {};
+  
+  async function updateMetadataHistory(forceRefresh = false) {
     if (!selectedCatalog) {
       clearMetadataHistory();
       return;
     }
     
+    // Build cache key from catalog, filter, and days
+    const filterParams = getActiveFilterParams();
+    const cacheKey = `${selectedCatalog}_${JSON.stringify(filterParams)}_${currentHistoryDays}`;
+    
+    // Check cache first (unless forced refresh)
+    if (!forceRefresh && window.historyCache[cacheKey]) {
+      const cached = window.historyCache[cacheKey];
+      const age = Date.now() - cached.timestamp;
+      
+      // Use cache if less than 5 minutes old
+      if (age < 5 * 60 * 1000) {
+        console.log('⚡ Using cached history data (age:', Math.round(age / 1000), 'seconds)');
+        populateHistoryTable(cached.data);
+        return;
+      }
+    }
+    
     try {
       showHistoryLoading();
       
-      const filterParams = getActiveFilterParams();
       const queryParams = new URLSearchParams(filterParams);
       queryParams.set('days', currentHistoryDays);
       
@@ -10937,8 +11405,14 @@ td.nowrap{white-space:nowrap}
       const data = await response.json();
       
       if (data.success && data.history) {
+        // Cache the results
+        window.historyCache[cacheKey] = {
+          data: data.history,
+          timestamp: Date.now()
+        };
+        
         populateHistoryTable(data.history);
-        console.log(`📈 Loaded ${data.history.length} history records for ${selectedCatalog}`);
+        console.log(`📈 Loaded ${data.history.length} history records for ${selectedCatalog} (cached)`);
       } else {
         throw new Error(data.error || 'Failed to load history');
       }
@@ -10947,6 +11421,23 @@ td.nowrap{white-space:nowrap}
       showHistoryError(error.message);
     } finally {
       hideHistoryLoading();
+    }
+  }
+  
+  // Function to clear history cache (call after new generation)
+  function clearHistoryCache(catalogName = null) {
+    if (catalogName) {
+      // Clear cache for specific catalog
+      Object.keys(window.historyCache).forEach(key => {
+        if (key.startsWith(catalogName + '_')) {
+          delete window.historyCache[key];
+        }
+      });
+      console.log('🗑️ Cleared history cache for catalog:', catalogName);
+    } else {
+      // Clear all cache
+      window.historyCache = {};
+      console.log('🗑️ Cleared all history cache');
     }
   }
   
@@ -11660,7 +12151,7 @@ td.nowrap{white-space:nowrap}
       type: 'scatter',
       data: {
         datasets: [{
-          label: 'PII Risk',
+          label: 'Sensitive Data Risk',
           data: processedData,
           backgroundColor: function(context) {
             const point = context.raw;
@@ -11947,8 +12438,9 @@ td.nowrap{white-space:nowrap}
     const modelsButtons = document.getElementById('models-footer-buttons');
     const piiButtons = document.getElementById('pii-footer-buttons');
     const tagsButtons = document.getElementById('tags-footer-buttons');
+    const samplingButtons = document.getElementById('sampling-footer-buttons');
     
-    if (fixedFooter && modelsButtons && piiButtons && tagsButtons) {
+    if (fixedFooter && modelsButtons && piiButtons && tagsButtons && samplingButtons) {
       // Show the fixed footer
       fixedFooter.classList.remove('hidden');
       
@@ -11956,6 +12448,7 @@ td.nowrap{white-space:nowrap}
       modelsButtons.classList.add('hidden');
       piiButtons.classList.add('hidden');
       tagsButtons.classList.add('hidden');
+      samplingButtons.classList.add('hidden');
       
       // Show models buttons by default (first tab)
       modelsButtons.classList.remove('hidden');
@@ -11983,8 +12476,9 @@ td.nowrap{white-space:nowrap}
     const modelsButtons = document.getElementById('models-footer-buttons');
     const piiButtons = document.getElementById('pii-footer-buttons');
     const tagsButtons = document.getElementById('tags-footer-buttons');
+    const samplingButtons = document.getElementById('sampling-footer-buttons');
     
-    if (fixedFooter && modelsButtons && piiButtons && tagsButtons) {
+    if (fixedFooter && modelsButtons && piiButtons && tagsButtons && samplingButtons) {
       // Show the fixed footer
       fixedFooter.classList.remove('hidden');
       
@@ -11992,6 +12486,7 @@ td.nowrap{white-space:nowrap}
       modelsButtons.classList.add('hidden');
       piiButtons.classList.add('hidden');
       tagsButtons.classList.add('hidden');
+      samplingButtons.classList.add('hidden');
       
       // Show the appropriate button set
       if (tabName === 'models') {
@@ -12000,6 +12495,10 @@ td.nowrap{white-space:nowrap}
         piiButtons.classList.remove('hidden');
       } else if (tabName === 'tags') {
         tagsButtons.classList.remove('hidden');
+      } else if (tabName === 'sampling') {
+        samplingButtons.classList.remove('hidden');
+        // Load sampling settings when tab is opened
+        loadSamplingSettings();
       }
     }
   }
@@ -12378,8 +12877,11 @@ td.nowrap{white-space:nowrap}
               <div class="pii-description" style="color: var(--text-muted); font-size: 14px;">
                 ${config.llm_assessment.description}
               </div>
-              <div class="pii-keywords" style="margin-top: 4px; font-size: 12px; color: var(--text-muted);">
-                Model: ${config.llm_assessment.model}
+              <div class="pii-keywords" style="margin-top: 8px; font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
+                <span>Model:</span>
+                <select id="pii-llm-model" class="model-dropdown" onchange="updatePIIModel('llm', this.value)" style="padding: 4px 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 12px; cursor: pointer;">
+                  <!-- Options populated dynamically -->
+                </select>
               </div>
             </div>
             <div class="pii-controls">
@@ -12413,8 +12915,8 @@ td.nowrap{white-space:nowrap}
               <div class="pii-description" style="color: var(--text-muted); font-size: 14px;">
                 ${config.llm_detection.description}
               </div>
-              <div class="pii-keywords" style="margin-top: 4px; font-size: 12px; color: var(--text-muted);">
-                Model: ${config.llm_detection.model}
+              <div class="pii-keywords" style="margin-top: 8px; font-size: 12px; color: var(--text-muted);">
+                Model configured above (shared with Assessment)
               </div>
             </div>
             <div class="pii-controls">
@@ -12512,6 +13014,80 @@ td.nowrap{white-space:nowrap}
     });
     
     container.innerHTML = patternsHTML;
+    
+    // Populate model dropdown after rendering
+    populatePIIModelDropdown(config.llm_detection.model);
+  }
+  
+  async function populatePIIModelDropdown(currentModel) {
+    try {
+      // Fetch models from Models settings
+      const response = await fetch('/api/settings/models');
+      const data = await response.json();
+      
+      // Extract enabled models from the models object
+      const modelsObj = data.models || {};
+      const enabledModels = Object.keys(modelsObj).filter(modelId => modelsObj[modelId].enabled === true);
+      
+      console.log('📋 Enabled models for PII detection:', enabledModels);
+      console.log('📋 Current PII model:', currentModel);
+      
+      // Check if current model is disabled
+      const isCurrentModelDisabled = currentModel && !enabledModels.includes(currentModel);
+      
+      // Build options HTML - only show enabled models
+      let optionsHTML = '';
+      
+      // If current model is disabled, show it as a warning option at the top
+      if (isCurrentModelDisabled) {
+        optionsHTML += '<option value="' + currentModel + '" selected disabled style="color: var(--error); background: var(--surface-2);">' + 
+                       '⚠️ ' + currentModel + ' (DISABLED - detection will be skipped)</option>';
+      }
+      
+      // Add all enabled models
+      optionsHTML += enabledModels.map(model => 
+        '<option value="' + model + '"' + (model === currentModel && !isCurrentModelDisabled ? ' selected' : '') + '>' + model + '</option>'
+      ).join('');
+      
+      // If no enabled models, show placeholder
+      if (enabledModels.length === 0) {
+        optionsHTML = '<option value="" disabled selected>No models enabled - go to Models settings</option>';
+      }
+      
+      // Populate the single shared dropdown
+      const dropdown = document.getElementById('pii-llm-model');
+      if (dropdown) {
+        dropdown.innerHTML = optionsHTML;
+      }
+      
+      // Log warning if current model is disabled
+      if (isCurrentModelDisabled) {
+        console.warn('⚠️ PII Detection model "' + currentModel + '" is disabled. LLM-based detection will be skipped until you select an enabled model.');
+      }
+      
+    } catch (error) {
+      console.error('Failed to populate PII model dropdown:', error);
+    }
+  }
+  
+  function updatePIIModel(type, model) {
+    console.log('Updating PII ' + type + ' model to: ' + model);
+    
+    // Track change
+    if (!window.piiSettingsChanges) {
+      window.piiSettingsChanges = {};
+    }
+    window.piiSettingsChanges.llm_model = model;
+    
+    // Enable save button
+    const saveBtn = document.getElementById('pii-save-btn');
+    if (saveBtn) {
+      saveBtn.style.background = 'var(--warning)';
+      saveBtn.textContent = 'Save Changes *';
+      saveBtn.disabled = false;
+    }
+    
+    console.log('📝 PII model change tracked: llm_model = ' + model);
   }
   
   // PII Pattern Management Functions
@@ -12863,6 +13439,16 @@ td.nowrap{white-space:nowrap}
         );
       }
       
+      if ('llm_model' in window.piiSettingsChanges) {
+        promises.push(
+          fetch('/api/settings/pii/llm-model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: window.piiSettingsChanges.llm_model })
+          })
+        );
+      }
+      
       // Add other PII settings as needed
       if ('pii_enabled' in window.piiSettingsChanges) {
         // TODO: Implement main PII toggle endpoint if needed
@@ -13124,6 +13710,356 @@ td.nowrap{white-space:nowrap}
     console.log('🔄 Tags settings reset to server values');
   }
   
+  // Sampling Settings
+  async function loadSamplingSettings() {
+    try {
+      const response = await fetch('/api/settings/sampling');
+      const data = await response.json();
+      
+      if (data.status === 'success') {
+        renderSamplingSettings(data.config);
+      } else {
+        throw new Error(data.error || 'Failed to load sampling settings');
+      }
+    } catch (error) {
+      console.error('Failed to load sampling settings:', error);
+    }
+  }
+  
+  function renderSamplingSettings(config) {
+    // Clear any pending changes when loading fresh config
+    window.samplingSettingsChanges = {};
+    
+    // Reset save button to default state
+    const saveBtn = document.getElementById('sampling-save-btn');
+    if (saveBtn) {
+      saveBtn.style.background = 'var(--primary)';
+      saveBtn.textContent = 'Save Changes';
+      saveBtn.disabled = false;
+    }
+    
+    // Update toggle
+    document.getElementById('sampling-enabled').checked = config.enable_sampling !== false;
+    
+    // Update sample size
+    const sampleRows = config.sample_rows || 10;
+    document.getElementById('sample-rows-slider').value = sampleRows;
+    document.getElementById('sample-rows-input').value = sampleRows;
+    
+    // Update redact PII toggle
+    document.getElementById('redact-pii-enabled').checked = config.redact_pii_in_samples === true;
+    
+    // Update batch sizing settings
+    if (document.getElementById('max-prompt-tokens-input')) {
+      document.getElementById('max-prompt-tokens-input').value = config.max_prompt_tokens || 4000;
+    }
+    if (document.getElementById('max-batch-schemas-input')) {
+      document.getElementById('max-batch-schemas-input').value = config.max_batch_schemas || 15;
+    }
+    if (document.getElementById('max-batch-tables-input')) {
+      document.getElementById('max-batch-tables-input').value = config.max_batch_tables || 10;
+    }
+    if (document.getElementById('max-batch-columns-input')) {
+      document.getElementById('max-batch-columns-input').value = config.max_batch_columns || 20;
+    }
+    if (document.getElementById('estimated-tokens-schema-input')) {
+      document.getElementById('estimated-tokens-schema-input').value = config.estimated_tokens_per_schema || 150;
+    }
+    if (document.getElementById('estimated-tokens-table-input')) {
+      document.getElementById('estimated-tokens-table-input').value = config.estimated_tokens_per_table || 300;
+    }
+    if (document.getElementById('estimated-tokens-column-input')) {
+      document.getElementById('estimated-tokens-column-input').value = config.estimated_tokens_per_column || 100;
+    }
+    
+    // Update status indicators
+    const samplingEnabledStatus = document.getElementById('sampling-enabled-status');
+    if (samplingEnabledStatus) {
+      const isEnabled = config.enable_sampling !== false;
+      samplingEnabledStatus.textContent = isEnabled ? 'Enabled' : 'Disabled';
+      samplingEnabledStatus.className = 'model-status ' + (isEnabled ? 'enabled' : 'disabled');
+    }
+    
+    const redactPiiStatus = document.getElementById('redact-pii-status');
+    if (redactPiiStatus) {
+      const isEnabled = config.redact_pii_in_samples === true;
+      redactPiiStatus.textContent = isEnabled ? 'Enabled' : 'Disabled';
+      redactPiiStatus.className = 'model-status ' + (isEnabled ? 'enabled' : 'disabled');
+    }
+    
+    // Update estimate with loaded values
+    updateBatchEstimate();
+  }
+  
+  function updateSamplingSlider(value) {
+    document.getElementById('sample-rows-input').value = value;
+    updateSamplingConfig('sample_rows', parseInt(value));
+  }
+  
+  function updateSamplingConfig(setting, value) {
+    // Update status indicator immediately for responsive UI
+    if (setting === 'enable_sampling') {
+      const statusElement = document.getElementById('sampling-enabled-status');
+      if (statusElement) {
+        statusElement.textContent = value ? 'Enabled' : 'Disabled';
+        statusElement.className = 'model-status ' + (value ? 'enabled' : 'disabled');
+      }
+    } else if (setting === 'redact_pii_in_samples') {
+      const statusElement = document.getElementById('redact-pii-status');
+      if (statusElement) {
+        statusElement.textContent = value ? 'Enabled' : 'Disabled';
+        statusElement.className = 'model-status ' + (value ? 'enabled' : 'disabled');
+      }
+    }
+    
+    // Sync slider and input
+    if (setting === 'sample_rows') {
+      document.getElementById('sample-rows-slider').value = value;
+      document.getElementById('sample-rows-input').value = value;
+    }
+    
+    // Track changes for batch save
+    if (!window.samplingSettingsChanges) {
+      window.samplingSettingsChanges = {};
+    }
+    window.samplingSettingsChanges[setting] = value;
+    
+    // Enable save button to indicate unsaved changes
+    const saveBtn = document.getElementById('sampling-save-btn');
+    if (saveBtn) {
+      saveBtn.style.background = 'var(--warning)';
+      saveBtn.textContent = 'Save Changes *';
+      saveBtn.disabled = false;
+    }
+    
+    console.log('✏️ Sampling config change tracked: ' + setting + ' = ' + value);
+    console.log('📦 Pending changes:', window.samplingSettingsChanges);
+  }
+  
+  async function saveSamplingSettings() {
+    const saveBtn = document.getElementById('sampling-save-btn');
+    const resetBtn = document.getElementById('sampling-reset-btn');
+    
+    if (!window.samplingSettingsChanges || Object.keys(window.samplingSettingsChanges).length === 0) {
+      alert('No changes to save.');
+      return;
+    }
+    
+    // Show loading state
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving...';
+      saveBtn.style.background = 'var(--text-muted)';
+    }
+    if (resetBtn) resetBtn.disabled = true;
+    
+    try {
+      const response = await fetch('/api/settings/sampling/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(window.samplingSettingsChanges)
+      });
+      
+      const data = await response.json();
+      if (data.status !== 'success') {
+        throw new Error(data.error || 'Failed to save sampling settings');
+      }
+      
+      // Clear tracked changes
+      window.samplingSettingsChanges = {};
+      
+      // Reset save button
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save Changes';
+        saveBtn.style.background = 'var(--primary)';
+      }
+      if (resetBtn) resetBtn.disabled = false;
+      
+      console.log('Sampling settings saved successfully');
+      
+      // Show success feedback
+      if (saveBtn) {
+        const originalText = saveBtn.textContent;
+        saveBtn.textContent = '✅ Saved!';
+        saveBtn.style.background = 'var(--good)';
+        setTimeout(function() {
+          saveBtn.textContent = originalText;
+          saveBtn.style.background = 'var(--primary)';
+        }, 2000);
+      }
+      
+    } catch (error) {
+      console.error('Failed to save sampling settings:', error);
+      alert('Failed to save sampling settings: ' + error.message);
+      
+      // Reset button state
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save Changes *';
+        saveBtn.style.background = 'var(--warning)';
+      }
+      if (resetBtn) resetBtn.disabled = false;
+    }
+  }
+  
+  async function resetSamplingSettings() {
+    if (window.samplingSettingsChanges && Object.keys(window.samplingSettingsChanges).length > 0) {
+      if (!confirm('Are you sure you want to discard your changes?')) {
+        return;
+      }
+    }
+    
+    // Clear tracked changes
+    window.samplingSettingsChanges = {};
+    
+    // Reload settings from server
+    await loadSamplingSettings();
+    
+    // Reset save button
+    const saveBtn = document.getElementById('sampling-save-btn');
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save Changes';
+      saveBtn.style.background = 'var(--primary)';
+    }
+    
+    console.log('Sampling settings reset to server values');
+  }
+  
+  function applyBatchPreset(presetName) {
+    const presets = {
+      conservative: {
+        max_prompt_tokens: 3000,
+        max_batch_schemas: 10,
+        max_batch_tables: 6,
+        max_batch_columns: 15,
+        estimated_tokens_per_schema: 180,
+        estimated_tokens_per_table: 350,
+        estimated_tokens_per_column: 120
+      },
+      balanced: {
+        max_prompt_tokens: 4000,
+        max_batch_schemas: 15,
+        max_batch_tables: 10,
+        max_batch_columns: 20,
+        estimated_tokens_per_schema: 150,
+        estimated_tokens_per_table: 300,
+        estimated_tokens_per_column: 100
+      },
+      aggressive: {
+        max_prompt_tokens: 8000,
+        max_batch_schemas: 30,
+        max_batch_tables: 20,
+        max_batch_columns: 40,
+        estimated_tokens_per_schema: 150,
+        estimated_tokens_per_table: 300,
+        estimated_tokens_per_column: 100
+      }
+    };
+    
+    const preset = presets[presetName];
+    if (!preset) return;
+    
+    // Apply all settings
+    Object.keys(preset).forEach(key => {
+      updateSamplingConfig(key, preset[key]);
+    });
+    
+    // Update UI elements directly
+    if (document.getElementById('max-prompt-tokens-input')) {
+      document.getElementById('max-prompt-tokens-input').value = preset.max_prompt_tokens;
+    }
+    if (document.getElementById('max-batch-schemas-input')) {
+      document.getElementById('max-batch-schemas-input').value = preset.max_batch_schemas;
+    }
+    if (document.getElementById('max-batch-tables-input')) {
+      document.getElementById('max-batch-tables-input').value = preset.max_batch_tables;
+    }
+    if (document.getElementById('max-batch-columns-input')) {
+      document.getElementById('max-batch-columns-input').value = preset.max_batch_columns;
+    }
+    if (document.getElementById('estimated-tokens-schema-input')) {
+      document.getElementById('estimated-tokens-schema-input').value = preset.estimated_tokens_per_schema;
+    }
+    if (document.getElementById('estimated-tokens-table-input')) {
+      document.getElementById('estimated-tokens-table-input').value = preset.estimated_tokens_per_table;
+    }
+    if (document.getElementById('estimated-tokens-column-input')) {
+      document.getElementById('estimated-tokens-column-input').value = preset.estimated_tokens_per_column;
+    }
+    
+    // Update estimate
+    updateBatchEstimate();
+  }
+  
+  function updateBatchEstimate() {
+    const objectType = document.getElementById('estimate-object-type')?.value || 'table';
+    const quantity = parseInt(document.getElementById('estimate-quantity')?.value || 1000);
+    
+    // Get current batch size for the object type
+    let batchSize;
+    if (objectType === 'schema') {
+      batchSize = parseInt(document.getElementById('max-batch-schemas-input')?.value || 15);
+    } else if (objectType === 'table') {
+      batchSize = parseInt(document.getElementById('max-batch-tables-input')?.value || 10);
+    } else {
+      batchSize = parseInt(document.getElementById('max-batch-columns-input')?.value || 20);
+    }
+    
+    // Calculate API calls needed
+    const apiCalls = Math.ceil(quantity / batchSize);
+    
+    // Estimate time (assuming ~2-3 seconds per API call on average)
+    const avgSecondsPerCall = 2.5;
+    const totalSeconds = apiCalls * avgSecondsPerCall;
+    let timeStr;
+    if (totalSeconds < 60) {
+      timeStr = Math.round(totalSeconds) + 's';
+    } else if (totalSeconds < 3600) {
+      timeStr = Math.round(totalSeconds / 60) + 'm';
+    } else {
+      const hours = Math.floor(totalSeconds / 3600);
+      const mins = Math.round((totalSeconds % 3600) / 60);
+      timeStr = hours + 'h ' + mins + 'm';
+    }
+    
+    // Estimate cost (rough estimate: $0.002 per 1K tokens, avg 1500 tokens per call)
+    const avgTokensPerCall = 1500; // Conservative estimate for input + output
+    const costPer1KTokens = 0.002; // Generic estimate
+    const totalCost = (apiCalls * avgTokensPerCall / 1000) * costPer1KTokens;
+    const costStr = totalCost < 0.01 ? '<$0.01' : '$' + totalCost.toFixed(2);
+    
+    // Update display
+    if (document.getElementById('estimate-api-calls')) {
+      document.getElementById('estimate-api-calls').textContent = apiCalls.toLocaleString();
+    }
+    if (document.getElementById('estimate-time')) {
+      document.getElementById('estimate-time').textContent = timeStr;
+    }
+    if (document.getElementById('estimate-cost')) {
+      document.getElementById('estimate-cost').textContent = costStr;
+    }
+    
+    // Provide recommendation
+    let recommendation = '';
+    if (apiCalls > 200) {
+      recommendation = '⚠️ Consider increasing batch sizes for faster processing';
+    } else if (apiCalls < 20) {
+      recommendation = '✅ Excellent! Very efficient batch configuration';
+    } else if (apiCalls < 50) {
+      recommendation = '✅ Good balance of speed and reliability';
+    } else if (apiCalls < 100) {
+      recommendation = '👍 Reasonable configuration for this workload';
+    } else {
+      recommendation = '💡 Moderate - consider using Aggressive preset for speed';
+    }
+    
+    if (document.getElementById('estimate-recommendation')) {
+      document.getElementById('estimate-recommendation').textContent = recommendation;
+    }
+  }
+
   // Expose Settings functions to global scope
   window.toggleUserDropdown = toggleUserDropdown;
   window.openSettings = openSettings;
@@ -13150,6 +14086,12 @@ td.nowrap{white-space:nowrap}
   window.resetModelsSettings = resetModelsSettings;
   window.savePIISettings = savePIISettings;
   window.resetPIISettings = resetPIISettings;
+  window.updateSamplingSlider = updateSamplingSlider;
+  window.updateSamplingConfig = updateSamplingConfig;
+  window.saveSamplingSettings = saveSamplingSettings;
+  window.resetSamplingSettings = resetSamplingSettings;
+  window.applyBatchPreset = applyBatchPreset;
+  window.updateBatchEstimate = updateBatchEstimate;
 
   // Expose Quality dashboard functions to global scope
   window.initializeQualityDashboard = initializeQualityDashboard;
@@ -13186,6 +14128,16 @@ td.nowrap{white-space:nowrap}
       Save Changes
     </button>
     <button id="tags-reset-btn" class="btn secondary" onclick="resetTagsSettings()" style="padding: 8px 16px;">
+      Reset
+    </button>
+  </div>
+  
+  <!-- Sampling Tab Buttons -->
+  <div id="sampling-footer-buttons" class="footer-tab-buttons hidden">
+    <button id="sampling-save-btn" class="btn primary" onclick="saveSamplingSettings()" style="padding: 8px 16px;">
+      Save Changes
+    </button>
+    <button id="sampling-reset-btn" class="btn secondary" onclick="resetSamplingSettings()" style="padding: 8px 16px;">
       Reset
     </button>
   </div>
@@ -13577,7 +14529,7 @@ def api_get_pii_settings():
                 "llm_assessment": {
                     "enabled": settings_pii_config.get('llm_assessment_enabled', True),
                     "model": "databricks-gemma-3-12b",
-                    "description": "Uses LLM to assess PII sensitivity and documentation quality"
+                    "description": "Uses LLM to assess regulatory/sensitive data and documentation quality"
                 },
                 "llm_detection": {
                     "enabled": settings_pii_config.get('llm_detection_enabled', True),
@@ -13606,12 +14558,12 @@ def api_get_pii_settings():
                 "llm_assessment": {
                     "enabled": True,
                     "model": "databricks-gemma-3-12b",
-                    "description": "Uses LLM to assess PII sensitivity and documentation quality"
+                    "description": "Uses LLM to assess regulatory/sensitive data and documentation quality"
                 },
                 "llm_detection": {
                     "enabled": True,
                     "model": "databricks-gemma-3-12b",
-                    "description": "Uses LLM to detect PII patterns in column names and data"
+                    "description": "Uses LLM to detect regulated/sensitive data patterns across all compliance frameworks"
                 },
                 "categories": [
                     {"name": "Government ID", "count": len([p for p in builtin_patterns if p.get('category') == 'Government ID'])},
@@ -13728,7 +14680,7 @@ def api_remove_pii_pattern():
 
 @flask_app.route("/api/settings/pii/llm-detection", methods=["POST"])
 def api_toggle_llm_detection():
-    """Toggle LLM-based PII detection"""
+    """Toggle LLM-based regulatory/sensitive data detection"""
     try:
         data = request.get_json()
         enabled = data.get('enabled', True)
@@ -13751,7 +14703,7 @@ def api_toggle_llm_detection():
 
 @flask_app.route("/api/settings/pii/llm-assessment", methods=["POST"])
 def api_toggle_llm_assessment():
-    """Toggle LLM-based PII assessment"""
+    """Toggle LLM-based regulatory/sensitive data assessment"""
     try:
         data = request.get_json()
         enabled = data.get('enabled', True)
@@ -13770,6 +14722,40 @@ def api_toggle_llm_assessment():
         
     except Exception as e:
         logger.error(f"Failed to toggle LLM Assessment: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@flask_app.route("/api/settings/pii/llm-model", methods=["POST"])
+def api_update_pii_llm_model():
+    """Update the LLM model used for PII detection and assessment"""
+    try:
+        data = request.get_json()
+        model = data.get('model', 'databricks-gemma-3-12b')
+        
+        # Validate that the model is enabled
+        models_config_mgr = get_models_config_manager_safe()
+        if models_config_mgr:
+            models = models_config_mgr.get_available_models()
+            if model not in models or not models[model].get('enabled', False):
+                logger.error(f"❌ Cannot set PII model to '{model}' - model is disabled")
+                return jsonify({
+                    "status": "error",
+                    "error": f"Model '{model}' is disabled. Please enable it in Models settings first, or select a different model."
+                }), 400
+        
+        # Update settings
+        settings_manager = get_settings_manager()
+        settings_manager.update_pii_config({
+            'llm_model': model
+        })
+        
+        logger.info(f"✅ PII LLM model updated to: {model}")
+        return jsonify({
+            "status": "success",
+            "message": f"PII LLM model updated to {model}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to update PII LLM model: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @flask_app.route("/api/settings/tags")
@@ -13838,6 +14824,59 @@ def api_update_tags_policy():
         return jsonify({"status": "success"})
     except Exception as e:
         logger.error(f"Failed to update tags policy: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@flask_app.route("/api/settings/sampling")
+def api_get_sampling_settings():
+    """Get sampling configuration"""
+    try:
+        # Try to get from settings manager
+        settings_manager = get_settings_manager_safe()
+        if settings_manager:
+            sampling_config = settings_manager.get_sampling_config()
+        else:
+            # If settings manager unavailable, return disabled state (don't sample by default)
+            logger.warning("Settings manager unavailable for sampling config - returning disabled state")
+            sampling_config = {
+                "enable_sampling": False,  # Disabled by default if settings unavailable
+                "sample_rows": 10,
+                "min_sample_rows": 5,
+                "max_sample_rows": 100
+            }
+        
+        return jsonify({
+            "status": "success",
+            "config": sampling_config,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Failed to get sampling settings: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@flask_app.route("/api/settings/sampling/update", methods=["POST"])
+def api_update_sampling_settings():
+    """Update sampling configuration"""
+    try:
+        data = request.get_json()
+        settings_manager = get_settings_manager_safe()
+        
+        if not settings_manager:
+            return jsonify({"status": "error", "error": "Settings manager unavailable"}), 500
+        
+        # Validate sample_rows if provided
+        if 'sample_rows' in data:
+            sample_rows = int(data['sample_rows'])
+            if sample_rows < 5 or sample_rows > 100:
+                return jsonify({"status": "error", "error": "sample_rows must be between 5 and 100"}), 400
+        
+        # Update sampling configuration
+        settings_manager.update_sampling_config(data)
+        
+        logger.info(f"✅ Updated sampling settings: {data}")
+        
+        return jsonify({"status": "success"})
+    except Exception as e:
+        logger.error(f"Failed to update sampling settings: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @flask_app.route("/api/quality-metrics/<catalog_name>")
