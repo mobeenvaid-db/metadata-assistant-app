@@ -51,20 +51,16 @@ git clone <your-repo-url>
 cd uc-metadata-assistant
 ```
 
-### 2. Configure app_react.yaml (React Version - Recommended)
+### 2. Configure app.yaml
 
 Update the SQL warehouse path:
 
-```yaml
-command: ["python", "app_react.py"]
 env:
   - name: DATABRICKS_HTTP_PATH
     value: /sql/1.0/warehouses/<your-warehouse-id>
   - name: DATABRICKS_SERVER_HOSTNAME
     value: <your-workspace>.cloud.databricks.net
 ```
-
-**For Legacy Version**: Use `app.yaml` instead and change command to `["flask", "--app", "app.py", "run"]`
 
 Note: `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`, `DATABRICKS_HOST`, and `DATABRICKS_WORKSPACE_ID` are automatically provided by Databricks Apps.
 
@@ -111,7 +107,6 @@ Navigate to the provided app URL and start generating metadata.
 ```
 governance_app/
 ├── app_react.py              # React version - Main Flask backend (RECOMMENDED)
-├── app_react.yaml            # React version - Databricks app configuration
 ├── app.py                    # Legacy version - Original Flask app
 ├── app.yaml                  # Legacy version - App configuration
 ├── enhanced_generator.py     # AI metadata generation engine (shared)
@@ -180,12 +175,6 @@ Tables:
 - `GET /api/governed-tags` - Fetch governed tags
 
 ## Performance
-
-| Catalog Size | Discovery | UI Response |
-|--------------|-----------|-------------|
-| Small (1K objects) | <2s | <100ms |
-| Medium (10K objects) | <5s | <150ms |
-| Large (100K objects) | <15s | <300ms |
 
 Generation time varies by:
 - LLM model (Gemma fastest, Claude slowest)
