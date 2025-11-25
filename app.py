@@ -1347,21 +1347,17 @@ class UnityMetadataService:
             ]
             
             for endpoint_url in endpoints_to_try:
-                logger.info(f"🔒 Attempting to fetch governed tags from: {endpoint_url}")
+                logger.debug(f"🔒 Attempting to fetch governed tags from: {endpoint_url}")
                 
                 try:
                     response = requests.get(endpoint_url, headers=headers)
-                    logger.info(f"🔒 Governed tags API response from {endpoint_url}: {response.status_code}")
                     
                     if response.status_code == 200:
                         response_data = response.json()
-                        logger.info(f"🔒 Raw governed tags response: {response_data}")
                         
                         # Parse Tag Policies API response format
                         # Expected format: {"tag_policies": [{"tag_key": "...", "allowed_values": [...], ...}]}
                         tag_policies = response_data.get('tag_policies', [])
-                        
-                        logger.info(f"🔒 Found {len(tag_policies)} tag policies")
                         
                         governed_tags = {}
                         for policy in tag_policies:
@@ -1373,8 +1369,6 @@ class UnityMetadataService:
                             
                             is_system = policy.get('is_system', False) or tag_key.startswith('system.')
                             
-                            logger.info(f"🔒 Processing policy: key='{tag_key}', values={allowed_values}, system={is_system}")
-                            
                             if tag_key:
                                 governed_tags[tag_key] = {
                                     'allowed_values': allowed_values,
@@ -1385,7 +1379,7 @@ class UnityMetadataService:
                                     'updated_at': policy.get('updated_at', '')
                                 }
                         
-                        logger.info(f"🔒 Final governed tags result: {governed_tags}")
+                        logger.info(f"✅ Fetched {len(governed_tags)} governed tags from Unity Catalog")
                         return governed_tags
                         
                     elif response.status_code == 404:
@@ -1735,7 +1729,7 @@ class UnityMetadataService:
                 FROM uc_metadata_assistant.generated_metadata.metadata_results 
                 WHERE full_name LIKE '{catalog_name}.%' 
                     AND status = 'generated'
-                    AND created_at <= CURRENT_DATE() - INTERVAL 7 DAYS  -- Generated >7 days ago but not committed
+                    AND generated_at <= CURRENT_DATE() - INTERVAL 7 DAYS  -- Generated >7 days ago but not committed
             """
             
             future = run_async_in_thread(setup_manager._execute_sql(sql_query))
@@ -1755,50 +1749,57 @@ class UnityMetadataService:
             return 0
 
     def _calculate_time_to_document(self, catalog_name: str) -> float:
-        """Calculate average time from data object creation to first documentation"""
+        """Calculate average time from data object creation to first documentation using metadata_results table"""
         try:
-            logger.info(f"📊 Calculating time-to-document for {catalog_name} (object creation to documentation)")
+            logger.info(f"📊 Calculating time-to-document for {catalog_name} (actual generation timestamps)")
             
-            # Query actual object creation vs documentation timing
+            # Get setup manager to access metadata_results table
+            setup_manager = get_setup_manager()
+            config = setup_manager.default_config
+            out_cat = config['output_catalog']
+            out_sch = config['output_schema']
+            out_tbl = config['results_table']
+            
+            # Query ACTUAL documentation timing from metadata_results joined with UC
             timing_sql = f"""
-                WITH object_documentation_timing AS (
+                WITH documented_objects AS (
+                    -- Tables with documentation from metadata_results
                     SELECT 
-                        table_name,
-                        table_schema,
-                        created as table_created,
-                        CASE 
-                            WHEN comment IS NOT NULL AND comment != '' 
-                            THEN created  -- Assume documented at creation if comment exists
-                            ELSE NULL 
-                        END as documented_at
-                    FROM {catalog_name}.information_schema.tables
-                    WHERE table_catalog = '{catalog_name}'
-                        AND table_schema NOT IN ('information_schema', 'system')
-                        AND created IS NOT NULL
-                
+                        t.created as object_created,
+                        MIN(mr.generated_at) as first_documented_at,
+                        mr.full_name
+                    FROM {catalog_name}.information_schema.tables t
+                    INNER JOIN `{out_cat}`.`{out_sch}`.`{out_tbl}` mr
+                        ON CONCAT('{catalog_name}', '.', t.table_schema, '.', t.table_name) = mr.full_name
+                        AND mr.object_type = 'table'
+                        AND mr.status IN ('generated', 'committed')
+                    WHERE t.table_catalog = '{catalog_name}'
+                        AND t.table_schema NOT IN ('information_schema', 'system')
+                        AND t.created IS NOT NULL
+                    GROUP BY t.created, mr.full_name
+                    
                     UNION ALL
                     
+                    -- Schemas with documentation from metadata_results
                     SELECT 
-                        CONCAT(table_name, '.', column_name) as object_name,
-                        table_schema,
-                        NULL as table_created,  -- We'll use table creation as proxy
-                        CASE 
-                            WHEN comment IS NOT NULL AND comment != '' 
-                            THEN CURRENT_TIMESTAMP()  -- Assume recent documentation
-                            ELSE NULL 
-                        END as documented_at
-                    FROM {catalog_name}.information_schema.columns
-                    WHERE table_catalog = '{catalog_name}'
-                        AND table_schema NOT IN ('information_schema', 'system')
-                        AND comment IS NOT NULL 
-                        AND comment != ''
+                        s.created as object_created,
+                        MIN(mr.generated_at) as first_documented_at,
+                        mr.full_name
+                    FROM {catalog_name}.information_schema.schemata s
+                    INNER JOIN `{out_cat}`.`{out_sch}`.`{out_tbl}` mr
+                        ON CONCAT('{catalog_name}', '.', s.schema_name) = mr.full_name
+                        AND mr.object_type = 'schema'
+                        AND mr.status IN ('generated', 'committed')
+                    WHERE s.catalog_name = '{catalog_name}'
+                        AND s.schema_name NOT IN ('information_schema', 'system')
+                        AND s.created IS NOT NULL
+                    GROUP BY s.created, mr.full_name
                 )
                 SELECT 
                     COUNT(*) as documented_objects,
-                    AVG(DATEDIFF(COALESCE(documented_at, CURRENT_TIMESTAMP()), table_created)) as avg_days_to_document
-                FROM object_documentation_timing
-                WHERE documented_at IS NOT NULL
-                    AND table_created IS NOT NULL
+                    AVG(DATEDIFF(first_documented_at, object_created)) as avg_days_to_document
+                FROM documented_objects
+                WHERE first_documented_at >= object_created
             """
             
             try:
@@ -2107,11 +2108,16 @@ class UnityMetadataService:
         try:
             logger.info(f"📈 Generating scalable audit-based trend for {catalog_name}")
             
-            # Get strategic historical points from audit logs (weekly intervals)
-            audit_points = self._get_audit_milestone_points(catalog_name)
-            
-            # Get any existing snapshots for this catalog
+            # Get any existing snapshots for this catalog first (fast query)
             snapshot_points = self._get_existing_snapshots(catalog_name)
+            
+            # Only query expensive audit logs if we have insufficient snapshot data
+            audit_points = []
+            if len(snapshot_points) < 5:
+                logger.info(f"📈 Querying audit logs (only {len(snapshot_points)} snapshots available)")
+                audit_points = self._get_audit_milestone_points(catalog_name)
+            else:
+                logger.info(f"📈 Skipping audit query (have {len(snapshot_points)} snapshots already)")
             
             # Combine and interpolate between known points
             combined_points = self._combine_and_interpolate_points(audit_points, snapshot_points, catalog_name)
@@ -2131,6 +2137,13 @@ class UnityMetadataService:
         """Get key milestone points from audit logs (weekly intervals over 90 days)"""
         try:
             from datetime import datetime, timedelta
+            
+            # Check cache first (15 minute TTL for audit data)
+            cache_key = f"audit_milestones_{catalog_name}"
+            cached = self._cache_get(cache_key, ttl_s=900)
+            if cached is not None:
+                logger.info(f"📈 Using cached audit milestone points for {catalog_name} ({len(cached)} points)")
+                return cached
             
             # Query audit logs for metadata creation events at weekly intervals
             audit_sql = f"""
@@ -2198,10 +2211,16 @@ class UnityMetadataService:
                             })
                 
                 logger.info(f"📈 Found {len(audit_points)} audit milestone points for {catalog_name}")
+                
+                # Cache the result (even if empty) for 15 minutes
+                self._cache_set(cache_key, audit_points, ttl_s=900)
+                
                 return audit_points
                 
             except Exception as query_error:
                 logger.warning(f"Audit query failed for {catalog_name}: {query_error}")
+                # Cache empty result to avoid repeated failed queries
+                self._cache_set(cache_key, [], ttl_s=900)
                 return []
                 
         except Exception as e:
@@ -3190,55 +3209,82 @@ Respond with only: Sensitivity: X, Documentation: Y"""
         return {}
 
     def _update_pii_cache_with_llm(self, catalog_name: str, column_name: str, llm_result: Dict):
-        """Update cached PII assessment with LLM insights"""
-        try:
-            # Ensure cache infrastructure exists (this will create the detailed table too)
-            if not self._ensure_cache_infrastructure():
-                logger.warning("🔒 Cache infrastructure not available, skipping LLM cache update")
-                return
-            
-            # Escape column name for SQL safety
-            safe_column_name = column_name.replace("'", "''")
-            
-            # Try to find the fullname from the current results if available
-            fullname = f"{catalog_name}.unknown.{safe_column_name}"  # Default fallback
-            
-            update_sql = f"""
-                MERGE INTO uc_metadata_assistant.cache.pii_column_assessments AS target
-                USING (
-                    SELECT 
-                        '{catalog_name}' as catalog_name,
-                        '{safe_column_name}' as column_name,
-                        '{fullname}' as column_fullname,
-                        {llm_result.get('sensitivity', 5)} as sensitivity_score,
-                        {llm_result.get('documentation', 5)} as documentation_score,
-                        '{llm_result.get('method', 'LLM')}' as assessment_method,
-                        {llm_result.get('confidence', 0.9)} as confidence_score,
-                        CURRENT_TIMESTAMP() as last_assessed,
-                        CURRENT_TIMESTAMP() as created_at
-                ) AS source
-                ON target.catalog_name = source.catalog_name AND target.column_name = source.column_name
-                WHEN MATCHED THEN UPDATE SET
-                    sensitivity_score = source.sensitivity_score,
-                    documentation_score = source.documentation_score,
-                    assessment_method = source.assessment_method,
-                    confidence_score = source.confidence_score,
-                    last_assessed = source.last_assessed
-                WHEN NOT MATCHED THEN INSERT (catalog_name, column_name, column_fullname, sensitivity_score, 
-                    documentation_score, assessment_method, confidence_score, last_assessed, created_at)
-                VALUES (source.catalog_name, source.column_name, source.column_fullname, source.sensitivity_score,
-                    source.documentation_score, source.assessment_method, source.confidence_score, 
-                    source.last_assessed, source.created_at)
-            """
-            
+        """Update cached PII assessment with LLM insights - with lock and retry logic for concurrent conflicts"""
+        import time
+        global pii_cache_merge_lock
+        
+        max_retries = 3
+        retry_delay = 0.5  # Start with 500ms
+        
+        for attempt in range(max_retries):
             try:
-                data = self._execute_sql_warehouse(update_sql)
-                logger.info(f"🔒 Updated LLM assessment for {column_name} (sensitivity: {llm_result.get('sensitivity', 5)}, documentation: {llm_result.get('documentation', 5)})")
-            except Exception as sql_error:
-                logger.warning(f"🔒 LLM cache SQL update failed: {sql_error}")
-            
-        except Exception as e:
-            logger.warning(f"🔒 LLM cache update error: {e}")
+                # Ensure cache infrastructure exists (this will create the detailed table too)
+                if not self._ensure_cache_infrastructure():
+                    logger.warning("🔒 Cache infrastructure not available, skipping LLM cache update")
+                    return
+                
+                # Escape column name for SQL safety
+                safe_column_name = column_name.replace("'", "''")
+                
+                # Try to find the fullname from the current results if available
+                fullname = f"{catalog_name}.unknown.{safe_column_name}"  # Default fallback
+                
+                update_sql = f"""
+                    MERGE INTO uc_metadata_assistant.cache.pii_column_assessments AS target
+                    USING (
+                        SELECT 
+                            '{catalog_name}' as catalog_name,
+                            '{safe_column_name}' as column_name,
+                            '{fullname}' as column_fullname,
+                            {llm_result.get('sensitivity', 5)} as sensitivity_score,
+                            {llm_result.get('documentation', 5)} as documentation_score,
+                            '{llm_result.get('method', 'LLM')}' as assessment_method,
+                            {llm_result.get('confidence', 0.9)} as confidence_score,
+                            CURRENT_TIMESTAMP() as last_assessed,
+                            CURRENT_TIMESTAMP() as created_at
+                    ) AS source
+                    ON target.catalog_name = source.catalog_name AND target.column_name = source.column_name
+                    WHEN MATCHED THEN UPDATE SET
+                        sensitivity_score = source.sensitivity_score,
+                        documentation_score = source.documentation_score,
+                        assessment_method = source.assessment_method,
+                        confidence_score = source.confidence_score,
+                        last_assessed = source.last_assessed
+                    WHEN NOT MATCHED THEN INSERT (catalog_name, column_name, column_fullname, sensitivity_score, 
+                        documentation_score, assessment_method, confidence_score, last_assessed, created_at)
+                    VALUES (source.catalog_name, source.column_name, source.column_fullname, source.sensitivity_score,
+                        source.documentation_score, source.assessment_method, source.confidence_score, 
+                        source.last_assessed, source.created_at)
+                """
+                
+                try:
+                    # Use global lock to serialize MERGE operations across all threads
+                    with pii_cache_merge_lock:
+                        data = self._execute_sql_warehouse(update_sql)
+                        logger.debug(f"🔒 Updated LLM assessment for {column_name} (sensitivity: {llm_result.get('sensitivity', 5)})")
+                    return  # Success! Exit retry loop
+                    
+                except Exception as sql_error:
+                    error_msg = str(sql_error)
+                    
+                    # Check if it's a concurrent write conflict
+                    if 'ConcurrentAppendException' in error_msg or 'DELTA_CONCURRENT' in error_msg:
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                            logger.warning(f"🔒 Concurrent MERGE conflict for {column_name}, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                            time.sleep(wait_time)
+                            continue  # Retry
+                        else:
+                            logger.error(f"🔒 Failed to update {column_name} after {max_retries} retries due to concurrent conflicts")
+                            return
+                    else:
+                        # Different error, don't retry
+                        logger.warning(f"🔒 LLM cache SQL update failed: {sql_error}")
+                        return
+                
+            except Exception as e:
+                logger.warning(f"🔒 LLM cache update error: {e}")
+                return
     
     def _estimate_pii_sensitivity(self, column_name: str) -> int:
         """Heuristic PII sensitivity estimation"""
@@ -3319,78 +3365,28 @@ Respond with only: Sensitivity: X, Documentation: Y"""
         """Calculate confidence distribution from metadata_results"""
         try:
             logger.info(f"📊 Calculating confidence distribution for {catalog_name}")
-            setup_manager = get_setup_manager()
-            # First check if the table exists
-            check_table_sql = """
-                SELECT COUNT(*) 
-                FROM uc_metadata_assistant.generated_metadata.metadata_results 
-                LIMIT 1
-            """
             
-            try:
-                future_check = run_async_in_thread(setup_manager._execute_sql(check_table_sql))
-                future_check.result(timeout=5)
-                logger.info(f"📊 metadata_results table exists, querying confidence data")
-            except Exception as table_error:
-                logger.info(f"📊 metadata_results table not accessible: {table_error}")
-                logger.info(f"📊 No confidence data found for {catalog_name}")
-                return []
-            
-            # First check if there's any data for this catalog
-            count_sql = f"""
-                SELECT COUNT(*) as total_records
-                FROM uc_metadata_assistant.generated_metadata.metadata_results 
+            # Simplified single query - no pre-checks, just try to get the data
+            sql_query = f"""
+                SELECT 
+                    CASE 
+                        WHEN confidence_score <= 0.1 THEN '0-10%'
+                        WHEN confidence_score <= 0.2 THEN '11-20%'
+                        WHEN confidence_score <= 0.3 THEN '21-30%'
+                        WHEN confidence_score <= 0.4 THEN '31-40%'
+                        WHEN confidence_score <= 0.5 THEN '41-50%'
+                        WHEN confidence_score <= 0.6 THEN '51-60%'
+                        WHEN confidence_score <= 0.7 THEN '61-70%'
+                        WHEN confidence_score <= 0.8 THEN '71-80%'
+                        WHEN confidence_score <= 0.9 THEN '81-90%'
+                        ELSE '91-100%'
+                    END as range_bucket,
+                    COUNT(*) as count_value
+                FROM uc_metadata_assistant.generated_metadata.metadata_results
                 WHERE full_name LIKE '{catalog_name}.%' 
                     AND confidence_score IS NOT NULL
                     AND confidence_score BETWEEN 0 AND 1
-            """
-            
-            try:
-                future_count = run_async_in_thread(setup_manager._execute_sql(count_sql))
-                count_result = future_count.result(timeout=5)
-                logger.info(f"📊 Count query result: {count_result}")
-                
-                # Handle structured response from setup_manager._execute_sql
-                if not count_result or not count_result.get('success') or not count_result.get('data') or len(count_result.get('data', [])) == 0:
-                    logger.info(f"📊 No count data returned for {catalog_name}")
-                    return []
-                
-                # Extract the actual count value from the structured response
-                count_data = count_result['data']
-                record_count = int(count_data[0][0]) if count_data[0][0] is not None else 0
-                if record_count == 0:
-                    logger.info(f"📊 No confidence records found for {catalog_name}")
-                    return []
-                
-                logger.info(f"📊 Found {record_count} confidence records for {catalog_name}")
-            except Exception as count_error:
-                logger.warning(f"📊 Error executing count query: {str(count_error)}")
-                logger.info(f"📊 Unable to retrieve confidence data")
-                return []
-            
-            # Use a simpler, more reliable query structure
-            sql_query = f"""
-                WITH confidence_ranges AS (
-                    SELECT 
-                        CASE 
-                            WHEN confidence_score <= 0.1 THEN '0-10%'
-                            WHEN confidence_score <= 0.2 THEN '11-20%'
-                            WHEN confidence_score <= 0.3 THEN '21-30%'
-                            WHEN confidence_score <= 0.4 THEN '31-40%'
-                            WHEN confidence_score <= 0.5 THEN '41-50%'
-                            WHEN confidence_score <= 0.6 THEN '51-60%'
-                            WHEN confidence_score <= 0.7 THEN '61-70%'
-                            WHEN confidence_score <= 0.8 THEN '71-80%'
-                            WHEN confidence_score <= 0.9 THEN '81-90%'
-                            ELSE '91-100%'
-                        END as range_bucket
-                    FROM uc_metadata_assistant.generated_metadata.metadata_results 
-                    WHERE full_name LIKE '{catalog_name}.%' 
-                        AND confidence_score IS NOT NULL
-                        AND confidence_score BETWEEN 0 AND 1
-                )
-                SELECT range_bucket, COUNT(*) as count_value
-                FROM confidence_ranges
+                    AND status IN ('generated', 'committed')
                 GROUP BY range_bucket
                 ORDER BY 
                     CASE range_bucket
@@ -3407,61 +3403,47 @@ Respond with only: Sensitivity: X, Documentation: Y"""
                     END
             """
             
-            try:
-                future = run_async_in_thread(setup_manager._execute_sql(sql_query))
-                query_result = future.result(timeout=10)
-                logger.info(f"📊 Main query result: {query_result}")
-                
-                # Handle structured response from setup_manager._execute_sql
-                if not query_result or not query_result.get('success') or not query_result.get('data'):
-                    logger.warning(f"📊 Main query failed or returned no data")
-                    return []
-                
-                data = query_result['data']
-                logger.info(f"📊 Main query returned {len(data) if data else 0} rows")
-            except Exception as query_error:
-                logger.warning(f"📊 Error executing main confidence query: {str(query_error)}")
-                logger.info(f"📊 Unable to retrieve confidence data")
+            # Use SQL warehouse (returns list directly)
+            data = self._execute_sql_warehouse(sql_query)
+            
+            if not data or len(data) == 0:
+                logger.info(f"📊 No confidence records found for {catalog_name}")
                 return []
             
-            # Create distribution with all ranges
+            logger.info(f"📊 Retrieved {len(data)} confidence buckets for {catalog_name}")
+            
+            # Define all ranges
             ranges = ["0-10%", "11-20%", "21-30%", "31-40%", "41-50%", "51-60%", "61-70%", "71-80%", "81-90%", "91-100%"]
             distribution = []
             
             # Convert SQL results to dict for lookup
             results_dict = {}
-            if data:
-                for row in data:
-                    try:
-                        range_name = row[0] if len(row) > 0 else ''
-                        count_value = row[1] if len(row) > 1 else 0
-                        # Handle various data types that might come from SQL
-                        if isinstance(count_value, (int, float)):
-                            results_dict[range_name] = int(count_value)
-                        elif isinstance(count_value, str) and count_value.isdigit():
-                            results_dict[range_name] = int(count_value)
-                        else:
-                            logger.warning(f"Unexpected count value for range {range_name}: {count_value} (type: {type(count_value)})")
-                            results_dict[range_name] = 0
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Error parsing confidence distribution row {row}: {e}")
-                        continue
+            for row in data:
+                try:
+                    range_name = row[0] if len(row) > 0 else ''
+                    count_value = row[1] if len(row) > 1 else 0
+                    # Handle various data types
+                    if isinstance(count_value, (int, float)):
+                        results_dict[range_name] = int(count_value)
+                    elif isinstance(count_value, str) and count_value.isdigit():
+                        results_dict[range_name] = int(count_value)
+                    else:
+                        results_dict[range_name] = 0
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing confidence row {row}: {e}")
+                    continue
             
+            # Build complete distribution with all ranges (0 for missing ranges)
             for range_name in ranges:
                 count = results_dict.get(range_name, 0)
                 distribution.append({"range": range_name, "count": count})
             
-            # Check if we have real data
             total_items = sum(d["count"] for d in distribution)
-            if total_items > 0:
-                logger.info(f"📊 Confidence distribution for {catalog_name}: {total_items} total items")
-                return distribution
-            else:
-                logger.info(f"📊 No confidence data found for {catalog_name}")
-                return []
+            logger.info(f"📊 Confidence distribution for {catalog_name}: {total_items} total items across {len(results_dict)} buckets")
+            return distribution if total_items > 0 else []
+            
         except Exception as e:
-            logger.warning(f"Error calculating confidence distribution for {catalog_name}: {str(e)}")
-            logger.warning(f"Confidence distribution error type: {type(e).__name__}")
+            logger.error(f"Error calculating confidence distribution for {catalog_name}: {str(e)}")
             return []
 
     def _calculate_accuracy_score(self, catalog_name: str) -> int:
@@ -3695,20 +3677,20 @@ class LLMMetadataGenerator:
         
         # Available models configuration
         self.available_models = {
-            "databricks-gpt-oss-120b": {
-                "name": "GPT-OSS 120B",
-                "description": "Databricks GPT OSS 120B - General purpose foundation model",
-                "max_tokens": 2048
+            "databricks-gpt-oss-20b": {
+                "name": "GPT-OSS-20B",
+                "description": "GPT-OSS 20B is a state-of-the-art, lightweight reasoning model built and trained by OpenAI. This model also has a 128K token context window and excels at real-time copilots and batch inference tasks.",
+                "max_tokens": 4096
             },
             "databricks-claude-sonnet-4": {
                 "name": "Claude Sonnet 4",
                 "description": "Anthropic Claude Sonnet 4 - Advanced reasoning",
                 "max_tokens": 4096
             },
-            "databricks-meta-llama-3-3-70b-instruct": {
-                "name": "Llama-3.3 70B Instruct",
-                "description": "Meta Llama 3.3 70B Instruct - Instruction following",
-                "max_tokens": 2048
+            "databricks-meta-llama-3-1-8b-instruct": {
+                "name": "Llama 3.1 8B",
+                "description": "Llama 3.1 is a state-of-the-art 8B parameter dense language model trained and released by Meta. The model supports a context length of 128K tokens.",
+                "max_tokens": 4096
             },
             "databricks-gemma-3-12b": {
                 "name": "Gemma 3 12B",
@@ -3787,10 +3769,10 @@ class LLMMetadataGenerator:
             styled_prompt = self._apply_style_to_prompt(prompt, style)
             
             # Use provided model or default
-            model_id = model or "databricks-gpt-oss-120b"
+            model_id = model or "databricks-gpt-oss-20b"
             
             # Get model-specific max_tokens
-            model_config = self.available_models.get(model_id, self.available_models["databricks-gpt-oss-120b"])
+            model_config = self.available_models.get(model_id, self.available_models["databricks-gpt-oss-20b"])
             actual_max_tokens = min(max_tokens, model_config["max_tokens"])
             
             headers = {
@@ -3801,6 +3783,8 @@ class LLMMetadataGenerator:
             # Construct endpoint URL
             endpoint_url = f"https://{self.workspace_host}/serving-endpoints/{model_id}/invocations"
             
+            # Build payload - exclude 'model' field for custom endpoints
+            # (model is already specified in the URL, including it can cause 400 errors for some endpoints)
             payload = {
                 'messages': [
                     {
@@ -3808,14 +3792,27 @@ class LLMMetadataGenerator:
                         'content': styled_prompt
                     }
                 ],
-                'model': model_id,
-                'max_tokens': actual_max_tokens,
-                'temperature': temperature
+                'max_tokens': actual_max_tokens
             }
+            
+            # Only include temperature for non-reasoning models
+            # Reasoning models (like GPT-5-Mini) only support temperature=1.0 (the default)
+            # For custom models, omit temperature to use the endpoint's default
+            if model_id in self.available_models and self.available_models[model_id].get("builtin", False):
+                # Builtin Databricks models support custom temperature
+                payload['temperature'] = temperature
+            # For custom models, omit temperature parameter (use endpoint default)
             
             logger.info(f"Calling LLM with prompt length: {len(styled_prompt)}")
             
             response = requests.post(endpoint_url, headers=headers, json=payload)
+            
+            # Log detailed error for debugging custom models
+            if response.status_code != 200:
+                logger.error(f"❌ LLM API Error {response.status_code} for model {model_id}")
+                logger.error(f"   Request payload: {payload}")
+                logger.error(f"   Response: {response.text}")
+            
             response.raise_for_status()
             
             result = response.json()
@@ -4225,6 +4222,9 @@ def run_async_in_thread(coroutine):
 # Global service instances
 unity_service = None
 llm_service = None
+
+# Global lock for PII cache MERGE operations to prevent concurrent Delta Lake conflicts
+pii_cache_merge_lock = threading.Lock()
 
 # Enhanced service instances
 enhanced_generator = None
@@ -4937,7 +4937,7 @@ def api_generate_by_type(catalog_name, item_type):
         
         # Get request parameters
         request_data = request.get_json() if request.is_json else {}
-        model = request_data.get('model', 'databricks-gpt-oss-120b')
+        model = request_data.get('model', 'databricks-gpt-oss-20b')
         temperature = request_data.get('temperature', 0.7)
         style = request_data.get('style', 'concise')
         
@@ -5390,7 +5390,7 @@ def api_get_models():
                 # Skip disabled models silently
             
             # Determine default model (first enabled model)
-            default_model = enabled_models[0] if enabled_models else "databricks-gpt-oss-120b"
+            default_model = enabled_models[0] if enabled_models else "databricks-gpt-oss-20b"
             
             return jsonify({
                 "status": "success",
@@ -5403,19 +5403,19 @@ def api_get_models():
             logger.warning(f"Settings not available, using fast static fallback: {settings_error}")
             # Fast static fallback - no database or service calls
             basic_models = {
-                "databricks-gpt-oss-120b": {
-                    "name": "GPT OSS 120B",
-                    "description": "Open source GPT model optimized for general tasks",
-                    "max_tokens": 2048
+                "databricks-gpt-oss-20b": {
+                    "name": "GPT-OSS-20B",
+                    "description": "GPT-OSS 20B is a state-of-the-art, lightweight reasoning model built and trained by OpenAI. This model also has a 128K token context window and excels at real-time copilots and batch inference tasks.",
+                    "max_tokens": 4096
                 },
                 "databricks-gemma-3-12b": {
                     "name": "Gemma 3 12B",
                     "description": "Google's Gemma model for efficient text generation",
                     "max_tokens": 2048
                 },
-                "databricks-meta-llama-3-3-70b-instruct": {
-                    "name": "Llama 3.3 70B Instruct",
-                    "description": "Meta's instruction-tuned Llama model",
+                "databricks-meta-llama-3-1-8b-instruct": {
+                    "name": "Llama 3.1 8B",
+                    "description": "Llama 3.1 is a state-of-the-art 8B parameter dense language model trained and released by Meta. The model supports a context length of 128K tokens.",
                     "max_tokens": 4096
                 },
                 "databricks-claude-sonnet-4": {
@@ -5428,7 +5428,7 @@ def api_get_models():
             return jsonify({
                 "status": "success",
                 "models": basic_models,
-                "default_model": "databricks-gpt-oss-120b",
+                "default_model": "databricks-gpt-oss-20b",
                 "fallback": True,
                 "timestamp": datetime.now().isoformat()
             })
@@ -5480,7 +5480,7 @@ def run_enhanced_generation():
     try:
         body = request.get_json() or {}
         catalog = body.get("catalog")
-        model = body.get("model", "databricks-gpt-oss-120b")
+        model = body.get("model", "databricks-gpt-oss-20b")
         style = body.get("style", "enterprise")
         selected_objects = body.get("selected_objects", {})
         
@@ -8244,7 +8244,7 @@ td.nowrap{white-space:nowrap}
 
   // Global variables
   let selectedCatalog = '';
-  let currentModel = 'databricks-gpt-oss-120b';
+  let currentModel = 'databricks-gpt-oss-20b';
   let currentStyle = 'concise';
   let currentTemperature = 0.7;
   let enhancedRunId = null;
@@ -14171,10 +14171,10 @@ def api_get_models_settings():
             
             # Fast static fallback for Settings page
             basic_models = {
-                "databricks-gpt-oss-120b": {
-                    "name": "GPT OSS 120B",
-                    "description": "Open source GPT model optimized for general tasks",
-                    "max_tokens": 2048,
+                "databricks-gpt-oss-20b": {
+                    "name": "GPT-OSS-20B",
+                    "description": "GPT-OSS 20B is a state-of-the-art, lightweight reasoning model built and trained by OpenAI. This model also has a 128K token context window and excels at real-time copilots and batch inference tasks.",
+                    "max_tokens": 4096,
                     "enabled": True,
                     "builtin": True,
                     "status": "available"
@@ -14187,9 +14187,9 @@ def api_get_models_settings():
                     "builtin": True,
                     "status": "available"
                 },
-                "databricks-meta-llama-3-3-70b-instruct": {
-                    "name": "Llama 3.3 70B Instruct",
-                    "description": "Meta's instruction-tuned Llama model",
+                "databricks-meta-llama-3-1-8b-instruct": {
+                    "name": "Llama 3.1 8B",
+                    "description": "Llama 3.1 is a state-of-the-art 8B parameter dense language model trained and released by Meta. The model supports a context length of 128K tokens.",
                     "max_tokens": 4096,
                     "enabled": True,
                     "builtin": True,

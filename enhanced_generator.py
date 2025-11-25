@@ -11,6 +11,7 @@ Version: 2.0 (Batch Processing)
 import json
 import logging
 import re
+import asyncio
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 import statistics
@@ -18,6 +19,9 @@ from collections import Counter
 from pii_detector import PIIDetector
 
 logger = logging.getLogger(__name__)
+
+# Semaphore for limiting concurrent LLM calls (5 parallel requests max)
+LLM_CONCURRENCY_LIMIT = 5
 
 class EnhancedMetadataGenerator:
     """
@@ -29,7 +33,7 @@ class EnhancedMetadataGenerator:
         self.llm_service = llm_service
         self.unity_service = unity_service
         self.settings_manager = settings_manager
-        self.pii_detector = PIIDetector(settings_manager, llm_service)
+        self.pii_detector = PIIDetector(settings_manager, llm_service, unity_service)
         self.progress_callback = None
         
         # Configuration - mirrors dbxmetagen variables.yml
@@ -65,13 +69,29 @@ class EnhancedMetadataGenerator:
             'max_batch_columns': sampling_config.get('max_batch_columns', 20),
             'estimated_tokens_per_schema': sampling_config.get('estimated_tokens_per_schema', 150),
             'estimated_tokens_per_table': sampling_config.get('estimated_tokens_per_table', 300),
-            'estimated_tokens_per_column': sampling_config.get('estimated_tokens_per_column', 100)
+            'estimated_tokens_per_column': sampling_config.get('estimated_tokens_per_column', 100),
+            # NEW: Max columns to analyze for table context (prevents wide table slowdown)
+            'max_table_context_columns': sampling_config.get('max_table_context_columns', 50)
         }
     
     def update_config(self, **kwargs):
         """Update generator configuration"""
         self.config.update(kwargs)
         logger.info(f"Updated config: {kwargs}")
+    
+    def _is_cancelled(self, run_id: str) -> bool:
+        """Check if generation run has been cancelled by user"""
+        try:
+            # Check Flask app's cancellation flags
+            from app_react import flask_app
+            if hasattr(flask_app, 'generation_cancellations'):
+                is_cancelled = run_id in flask_app.generation_cancellations
+                if is_cancelled:
+                    logger.info(f"🛑 Cancellation detected for run: {run_id}")
+                return is_cancelled
+        except Exception as e:
+            logger.debug(f"Could not check cancellation status: {e}")
+        return False
     
     def _estimate_prompt_tokens(self, text: str) -> int:
         """Rough estimation of token count (1 token ≈ 4 characters for English)"""
@@ -205,11 +225,26 @@ class EnhancedMetadataGenerator:
             # Use debug level to avoid log spam during generation
             logger.debug(f"Progress callback error: {e}")
     
-    async def generate_enhanced_metadata(self, catalog_name: str, model: str, style: str = 'enterprise', selected_objects: Dict = None, run_id: str = None) -> Dict:
+    async def generate_enhanced_metadata(self, catalog_name: str, model: str, style: str = 'enterprise', selected_objects: Dict = None, run_id: str = None, pii_model: str = None) -> Dict:
         """
         Generate enhanced metadata for entire catalog with PII detection and data profiling
+        
+        Args:
+            catalog_name: Name of the catalog
+            model: LLM model for metadata generation
+            style: Generation style (enterprise, technical, business, concise)
+            selected_objects: Dict of selected schemas/tables/columns
+            run_id: Unique run identifier
+            pii_model: Optional LLM model for PII detection (defaults to metadata model)
         """
-        logger.info(f"Starting enhanced metadata generation for {catalog_name}")
+        # Default pii_model to metadata model if not specified
+        if not pii_model:
+            pii_model = model
+        
+        # Store pii_model for use in nested methods
+        self._current_pii_model = pii_model
+            
+        logger.info(f"Starting enhanced metadata generation for {catalog_name} (metadata: {model}, PII: {pii_model})")
         
         # Reload settings before each generation run to pick up any changes
         if self.settings_manager:
@@ -226,6 +261,7 @@ class EnhancedMetadataGenerator:
                 self.config['estimated_tokens_per_schema'] = sampling_config.get('estimated_tokens_per_schema', self.config['estimated_tokens_per_schema'])
                 self.config['estimated_tokens_per_table'] = sampling_config.get('estimated_tokens_per_table', self.config['estimated_tokens_per_table'])
                 self.config['estimated_tokens_per_column'] = sampling_config.get('estimated_tokens_per_column', self.config['estimated_tokens_per_column'])
+                self.config['max_table_context_columns'] = sampling_config.get('max_table_context_columns', self.config['max_table_context_columns'])
                 logger.info(f"🔄 Reloaded settings: sample_rows={self.config['sample_rows']}, enable_sampling={self.config['enable_sampling']}")
             except Exception as e:
                 logger.warning(f"Could not reload sampling config: {e}, using cached config")
@@ -283,42 +319,74 @@ class EnhancedMetadataGenerator:
                 current_object="Starting schema analysis..."
             )
             
+            # Check for cancellation before starting schemas
+            if self._is_cancelled(run_id):
+                logger.info(f"🛑 Generation cancelled before schema processing")
+                results['status'] = 'CANCELLED'
+                results['cancelled_at'] = datetime.now().isoformat()
+                return results
+            
             # Process schemas in batches with intelligent sizing
             schema_batches = self._split_into_smart_batches(missing_schemas, 'schema')
             logger.info(f"📦 Processing {len(missing_schemas)} schemas in {len(schema_batches)} intelligent batches")
             
-            for batch_idx, schema_batch in enumerate(schema_batches, 1):
-                logger.info(f"📦 Processing schema batch {batch_idx}/{len(schema_batches)} ({len(schema_batch)} schemas)")
-                
-                try:
-                    batch_metadata = await self._generate_schemas_batch(
-                        schema_batch, catalog_name, model, style, run_id
-                    )
+            # Define async batch processor with semaphore for parallel execution
+            semaphore = asyncio.Semaphore(LLM_CONCURRENCY_LIMIT)
+            
+            async def process_schema_batch_with_limit(batch_idx, schema_batch):
+                async with semaphore:
+                    # Check for cancellation before processing each batch
+                    if self._is_cancelled(run_id):
+                        logger.info(f"🛑 Skipping schema batch {batch_idx} due to cancellation")
+                        return 0
                     
-                    for metadata in batch_metadata:
-                        results['generated_metadata'].append(metadata)
-                        results['summary']['processed_objects'] += 1
-                        
-                        # Update progress after each schema
-                        self._update_progress(
-                            processed_objects=results['summary']['processed_objects'],
-                            current_object=f"Schema: {metadata['full_name'].split('.')[1]}"
+                    logger.info(f"📦 Processing schema batch {batch_idx}/{len(schema_batches)} ({len(schema_batch)} schemas)")
+                    
+                    try:
+                        batch_metadata = await self._generate_schemas_batch(
+                            schema_batch, catalog_name, model, style, run_id
                         )
                         
-                        if metadata.get('pii_detected'):
-                            results['summary']['pii_objects_detected'] += 1
-                        if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
-                            results['summary']['high_confidence_results'] += 1
+                        for metadata in batch_metadata:
+                            results['generated_metadata'].append(metadata)
+                            results['summary']['processed_objects'] += 1
                             
-                except Exception as e:
-                    logger.error(f"Error processing schema batch: {e}")
-                    results['summary']['errors'] += len(schema_batch)
-                    # Update progress even on error
-                    self._update_progress(
-                        processed_objects=results['summary']['processed_objects'],
-                        current_object=f"Schema batch (error)",
-                        errors=[str(e)]
-                    )
+                            # Update progress after each schema
+                            self._update_progress(
+                                processed_objects=results['summary']['processed_objects'],
+                                current_object=f"Schema: {metadata['full_name'].split('.')[1]}"
+                            )
+                            
+                            if metadata.get('pii_detected'):
+                                results['summary']['pii_objects_detected'] += 1
+                            if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
+                                results['summary']['high_confidence_results'] += 1
+                        
+                        return len(batch_metadata)
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing schema batch: {e}")
+                        results['summary']['errors'] += len(schema_batch)
+                        # Update progress even on error
+                        self._update_progress(
+                            processed_objects=results['summary']['processed_objects'],
+                            current_object=f"Schema batch (error)",
+                            errors=[str(e)]
+                        )
+                        return 0
+            
+            # Execute all batches in parallel (with semaphore limiting to 5 concurrent)
+            await asyncio.gather(*[
+                process_schema_batch_with_limit(idx + 1, batch) 
+                for idx, batch in enumerate(schema_batches)
+            ])
+            
+            # Check for cancellation before starting tables
+            if self._is_cancelled(run_id):
+                logger.info(f"🛑 Generation cancelled after schema processing")
+                results['status'] = 'CANCELLED'
+                results['cancelled_at'] = datetime.now().isoformat()
+                return results
             
             # Update progress: Moving to table analysis
             self._update_progress(
@@ -331,37 +399,62 @@ class EnhancedMetadataGenerator:
             table_batches = self._split_into_smart_batches(missing_tables, 'table')
             logger.info(f"📦 Processing {len(missing_tables)} tables in {len(table_batches)} intelligent batches")
             
-            for batch_idx, table_batch in enumerate(table_batches, 1):
-                logger.info(f"📦 Processing table batch {batch_idx}/{len(table_batches)} ({len(table_batch)} tables)")
-                
-                try:
-                    batch_metadata = await self._generate_tables_batch(
-                        table_batch, catalog_name, model, style, run_id
-                    )
+            # Define async batch processor with semaphore for parallel execution
+            semaphore_tables = asyncio.Semaphore(LLM_CONCURRENCY_LIMIT)
+            
+            async def process_table_batch_with_limit(batch_idx, table_batch):
+                async with semaphore_tables:
+                    # Check for cancellation before processing each batch
+                    if self._is_cancelled(run_id):
+                        logger.info(f"🛑 Skipping table batch {batch_idx} due to cancellation")
+                        return 0
                     
-                    for metadata in batch_metadata:
-                        results['generated_metadata'].append(metadata)
-                        results['summary']['processed_objects'] += 1
-                        
-                        # Update progress after each table
-                        self._update_progress(
-                            processed_objects=results['summary']['processed_objects'],
-                            current_object=f"Table: {metadata['full_name'].split('.')[-1]}"
+                    logger.info(f"📦 Processing table batch {batch_idx}/{len(table_batches)} ({len(table_batch)} tables)")
+                    
+                    try:
+                        batch_metadata = await self._generate_tables_batch(
+                            table_batch, catalog_name, model, style, run_id
                         )
                         
-                        if metadata.get('pii_detected'):
-                            results['summary']['pii_objects_detected'] += 1
-                        if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
-                            results['summary']['high_confidence_results'] += 1
+                        for metadata in batch_metadata:
+                            results['generated_metadata'].append(metadata)
+                            results['summary']['processed_objects'] += 1
                             
-                except Exception as e:
-                    logger.error(f"Error processing table batch: {e}")
-                    results['summary']['errors'] += len(table_batch)
-                    # Update progress even on error
-                    self._update_progress(
-                        processed_objects=results['summary']['processed_objects'],
-                        current_object=f"Table batch (error)"
-                    )
+                            # Update progress after each table
+                            self._update_progress(
+                                processed_objects=results['summary']['processed_objects'],
+                                current_object=f"Table: {metadata['full_name'].split('.')[-1]}"
+                            )
+                            
+                            if metadata.get('pii_detected'):
+                                results['summary']['pii_objects_detected'] += 1
+                            if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
+                                results['summary']['high_confidence_results'] += 1
+                        
+                        return len(batch_metadata)
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing table batch: {e}")
+                        results['summary']['errors'] += len(table_batch)
+                        # Update progress even on error
+                        self._update_progress(
+                            processed_objects=results['summary']['processed_objects'],
+                            current_object=f"Table batch (error)"
+                        )
+                        return 0
+            
+            # Execute all batches in parallel (with semaphore limiting to 5 concurrent)
+            await asyncio.gather(*[
+                process_table_batch_with_limit(idx + 1, batch) 
+                for idx, batch in enumerate(table_batches)
+            ])
+            
+            # Check for cancellation before starting columns
+            if self._is_cancelled(run_id):
+                logger.info(f"🛑 Generation cancelled after table processing")
+                results['status'] = 'CANCELLED'
+                results['cancelled_at'] = datetime.now().isoformat()
+                return results
             
             # Update progress: Moving to column analysis
             self._update_progress(
@@ -591,7 +684,11 @@ DO NOT mention specific table names in descriptions - use them only to understan
         return results
     
     async def _generate_table_metadata_enhanced(self, table_info: Dict, catalog_name: str, model: str, style: str, run_id: str = None) -> Dict:
-        """Generate enhanced table metadata with column analysis and PII detection"""
+        """Generate enhanced table metadata using column names/types for context.
+        
+        NOTE: PII detection is NOT performed at table-level. 
+        PII detection should ONLY happen when generating column-level metadata.
+        """
         table_name = table_info['name']
         schema_name = table_info['schema_name']
         full_name = f"{catalog_name}.{schema_name}.{table_name}"
@@ -605,21 +702,9 @@ DO NOT mention specific table names in descriptions - use them only to understan
             logger.warning(f"Could not get columns for table {full_name}: {e}")
             columns_info = []
         
-        # Perform PII analysis on the table
-        pii_analysis = None
-        if self.config['enable_pii_detection'] and columns_info:
-            try:
-                logger.info(f"🔍 Starting PII detection for table {full_name} with {len(columns_info)} columns")
-                pii_analysis = self.pii_detector.analyze_table({
-                    'name': table_name,
-                    'columns': columns_info
-                })
-                if pii_analysis and pii_analysis.get('pii_columns', 0) > 0:
-                    logger.info(f"⚠️ PII detected in {full_name}: {pii_analysis['pii_columns']}/{pii_analysis['total_columns']} columns, classification: {pii_analysis.get('highest_classification', 'UNKNOWN')}")
-                else:
-                    logger.info(f"✅ No PII detected in {full_name}")
-            except Exception as e:
-                logger.warning(f"❌ PII analysis failed for table {full_name}: {e}")
+        # NOTE: PII detection is NOT performed for table-level generation
+        # PII detection should ONLY happen when generating column-level metadata
+        # Here we just use column names/types for context to help LLM understand table structure
         
         # Build enhanced context with optional sample values
         context_info = {
@@ -631,18 +716,18 @@ DO NOT mention specific table names in descriptions - use them only to understan
             'column_names': [col['name'] for col in columns_info[:15]],  # Limit for context
             'data_types': [col['data_type'] for col in columns_info[:15]],
             'owner': table_info.get('owner', ''),
-            'pii_analysis': pii_analysis
+            'pii_analysis': None  # No PII analysis for tables
         }
         
-        # Add sample values if sampling is enabled
+        # Add sample values if sampling is enabled (no PII redaction needed for tables)
         if self.config.get('enable_sampling', True) and columns_info:
             columns_with_samples = self._prepare_column_samples_for_context(
                 columns_info[:15],  # Limit to first 15 columns
-                pii_analysis,
-                redact_pii=self.config.get('redact_pii_in_samples', False)
+                None,  # No PII analysis for tables
+                redact_pii=False  # No PII redaction for table-level generation
             )
             context_info['column_samples'] = columns_with_samples
-            logger.info(f"📊 Including sample values for {len(columns_with_samples)} columns in LLM context (redact_pii={self.config.get('redact_pii_in_samples', False)})")
+            logger.info(f"📊 Including sample values for {len(columns_with_samples)} columns in LLM context")
         
         # Generate description with enhanced context
         prompt = self._build_table_prompt(context_info, style)
@@ -656,12 +741,6 @@ DO NOT mention specific table names in descriptions - use them only to understan
                 style=style
             )
             
-            # Clean description if classification is PUBLIC/INTERNAL (remove PII hallucinations)
-            if pii_analysis:
-                classification = pii_analysis.get('highest_classification', 'INTERNAL')
-                if classification in ['PUBLIC', 'INTERNAL']:
-                    description = self._sanitize_description(description)
-            
             confidence_score = self._calculate_confidence_score(description, context_info, 'table')
             
         except Exception as e:
@@ -669,23 +748,11 @@ DO NOT mention specific table names in descriptions - use them only to understan
             description = f"Table containing {table_name.replace('_', ' ')} data with related attributes"
             confidence_score = 0.3
         
-        # Extract PII information
+        # Tables do not have PII detection - PII detection is only for columns
         pii_detected = False
         pii_tags = []
         policy_tags = []
         classification = 'INTERNAL'
-        
-        if pii_analysis:
-            # Only flag as PII detected if classification is truly sensitive (not PUBLIC or INTERNAL)
-            highest_class = pii_analysis.get('highest_classification', 'INTERNAL')
-            pii_detected = highest_class in ['PII', 'PHI', 'PCI', 'CONFIDENTIAL', 'SENSITIVE']
-            policy_tags = pii_analysis.get('recommended_tags', [])
-            classification = highest_class
-            
-            # Extract PII types for tags
-            for col_analysis in pii_analysis.get('column_analysis', []):
-                if col_analysis['pii_types']:
-                    pii_tags.extend(col_analysis['pii_types'])
         
         return {
             'run_id': run_id,
@@ -693,15 +760,15 @@ DO NOT mention specific table names in descriptions - use them only to understan
             'object_type': 'table',
             'proposed_comment': description,
             'confidence_score': confidence_score,
-            'pii_tags': json.dumps(list(set(pii_tags))),
-            'policy_tags': json.dumps(policy_tags),
+            'pii_tags': json.dumps([]),  # Empty for tables
+            'policy_tags': json.dumps([]),  # Empty for tables
             'data_classification': classification,
             'source_model': model,
             'generation_style': style,
             'context_used': context_info,
-            'pii_analysis': pii_analysis,
+            'pii_analysis': None,  # No PII analysis for tables
             'generated_at': datetime.now().isoformat(),
-            'pii_detected': pii_detected
+            'pii_detected': False  # Always False for tables
         }
     
     async def _generate_tables_batch(self, tables: List[Dict], catalog_name: str, model: str, style: str, run_id: str = None) -> List[Dict]:
@@ -733,20 +800,8 @@ DO NOT mention specific table names in descriptions - use them only to understan
                 logger.warning(f"Could not get columns for table {full_name}: {e}")
                 columns_info = []
             
-            # PII analysis
-            pii_analysis = None
-            if self.config['enable_pii_detection'] and columns_info:
-                # Progress update: PII Detection starting
-                self._update_progress(
-                    current_object=f"PII Detection: {table_name} ({len(columns_info)} cols)"
-                )
-                try:
-                    pii_analysis = self.pii_detector.analyze_table({
-                        'name': table_name,
-                        'columns': columns_info
-                    })
-                except Exception as e:
-                    logger.warning(f"PII analysis failed for table {full_name}: {e}")
+            # NOTE: No PII analysis for table-level generation
+            # PII detection should ONLY happen when generating column-level metadata
             
             # Build context with optional sample values
             context = {
@@ -758,16 +813,16 @@ DO NOT mention specific table names in descriptions - use them only to understan
                 'column_names': [col['name'] for col in columns_info[:10]],  # Limit to 10 for batch
                 'data_types': list(set([col['data_type'] for col in columns_info[:10]])),
                 'owner': table_info.get('owner', ''),
-                'pii_analysis': pii_analysis,
+                'pii_analysis': None,  # No PII analysis for tables
                 'columns_info': columns_info
             }
             
-            # Add sample values if sampling is enabled
+            # Add sample values if sampling is enabled (no PII redaction for tables)
             if self.config.get('enable_sampling', True) and columns_info:
                 columns_with_samples = self._prepare_column_samples_for_context(
                     columns_info[:8],  # Limit to 8 columns for batch
-                    pii_analysis,
-                    redact_pii=self.config.get('redact_pii_in_samples', False)
+                    None,  # No PII analysis for tables
+                    redact_pii=False  # No PII redaction for table-level generation
                 )
                 context['column_samples'] = columns_with_samples
             
@@ -780,9 +835,6 @@ DO NOT mention specific table names in descriptions - use them only to understan
         
         for i, ctx in enumerate(table_contexts, 1):
             col_names_str = ', '.join(ctx['column_names'][:5])
-            pii_info = ""
-            if ctx['pii_analysis'] and ctx['pii_analysis'].get('pii_columns', 0) > 0:
-                pii_info = f" | ⚠️ Contains PII ({ctx['pii_analysis']['pii_columns']} columns)"
             
             sample_info = ""
             if ctx.get('column_samples'):
@@ -792,7 +844,7 @@ DO NOT mention specific table names in descriptions - use them only to understan
                     sample_preview.append(f"{col_sample['column_name']}: {samples_str}")
                 sample_info = f" | Samples: {'; '.join(sample_preview)}"
             
-            batch_prompt += f"{i}. {ctx['schema_name']}.{ctx['table_name']} ({ctx['column_count']} columns: {col_names_str}){pii_info}{sample_info}\n"
+            batch_prompt += f"{i}. {ctx['schema_name']}.{ctx['table_name']} ({ctx['column_count']} columns: {col_names_str}){sample_info}\n"
         
         batch_prompt += f"""
 For each table, provide a 2-3 sentence description explaining:
@@ -823,16 +875,16 @@ DO NOT mention specific column names or sample values - use them only to underst
                     'object_type': 'table',
                     'proposed_comment': f"Table containing {ctx['table_name'].replace('_', ' ')} information",
                     'confidence_score': 0.3,
-                    'pii_tags': '[]',
-                    'policy_tags': '[]',
-                    'proposed_policy_tags': '[]',
-                    'data_classification': 'INTERNAL',
+                    'pii_tags': '[]',  # Empty for tables
+                    'policy_tags': '[]',  # Empty for tables
+                    'proposed_policy_tags': '[]',  # Empty for tables
+                    'data_classification': 'INTERNAL',  # Default for tables
                     'source_model': model,
                     'generation_style': style,
                     'context_used': ctx,
-                    'pii_analysis': ctx['pii_analysis'],
+                    'pii_analysis': None,  # No PII analysis for tables
                     'generated_at': datetime.now().isoformat(),
-                    'pii_detected': False
+                    'pii_detected': False  # Always False for tables
                 }]
         
         try:
@@ -864,16 +916,9 @@ DO NOT mention specific column names or sample values - use them only to underst
         results = []
         for ctx, description in zip(table_contexts, descriptions):
             full_name = f"{ctx['catalog_name']}.{ctx['schema_name']}.{ctx['table_name']}"
-            pii_analysis = ctx['pii_analysis']
-            # Only flag as PII detected if classification is truly sensitive (not PUBLIC or INTERNAL)
-            highest_class = pii_analysis.get('highest_classification', 'INTERNAL') if pii_analysis else 'INTERNAL'
-            pii_detected = highest_class in ['PII', 'PHI', 'PCI', 'CONFIDENTIAL', 'SENSITIVE']
             
-            # Clean description if classification is PUBLIC/INTERNAL (remove PII hallucinations)
-            if highest_class in ['PUBLIC', 'INTERNAL']:
-                description = self._sanitize_description(description)
-            
-            confidence_score = self._calculate_confidence_score(description, ctx, 'table', pii_analysis)
+            # Tables do not have PII detection - PII detection is only for columns
+            confidence_score = self._calculate_confidence_score(description, ctx, 'table', None)
             
             results.append({
                 'run_id': run_id,
@@ -881,16 +926,16 @@ DO NOT mention specific column names or sample values - use them only to underst
                 'object_type': 'table',
                 'proposed_comment': description,
                 'confidence_score': confidence_score,
-                'pii_tags': json.dumps(pii_analysis.get('pii_types', [])) if pii_analysis else '[]',
-                'policy_tags': '[]',  # No automatic tags
-                'proposed_policy_tags': json.dumps(pii_analysis.get('proposed_policy_tags', [])) if pii_analysis else '[]',
-                'data_classification': pii_analysis.get('highest_classification', 'INTERNAL') if pii_analysis else 'INTERNAL',
+                'pii_tags': '[]',  # Empty for tables
+                'policy_tags': '[]',  # Empty for tables
+                'proposed_policy_tags': '[]',  # Empty for tables
+                'data_classification': 'INTERNAL',  # Default for tables
                 'source_model': model,
                 'generation_style': style,
                 'context_used': ctx,
-                'pii_analysis': pii_analysis,
+                'pii_analysis': None,  # No PII analysis for tables
                 'generated_at': datetime.now().isoformat(),
-                'pii_detected': pii_detected
+                'pii_detected': False  # Always False for tables
             })
         
         logger.info(f"✅ Batch generated {len(results)} table descriptions")
@@ -919,6 +964,11 @@ DO NOT mention specific column names or sample values - use them only to underst
         
         # Process each table's columns together
         for table_key, table_columns in table_groups.items():
+            # Check for cancellation before processing each table's columns
+            if self._is_cancelled(run_id):
+                logger.info(f"🛑 Stopping column processing for {table_key} due to cancellation")
+                break
+            
             try:
                 # Get sample data for all columns in this table
                 enriched_columns = await self._enrich_columns_with_samples(table_columns)
@@ -927,6 +977,11 @@ DO NOT mention specific column names or sample values - use them only to underst
                 chunks = self._create_optimal_chunks(enriched_columns)
                 
                 for chunk in chunks:
+                    # Check for cancellation before processing each chunk
+                    if self._is_cancelled(run_id):
+                        logger.info(f"🛑 Stopping chunk processing due to cancellation")
+                        break
+                    
                     try:
                         chunk_results = await self._generate_column_chunk_metadata(
                             chunk, model, style, run_id
@@ -985,8 +1040,13 @@ DO NOT mention specific column names or sample values - use them only to underst
         
         # Log sample data availability
         columns_with_samples = sum(1 for col in columns if col.get('sample_values'))
+        redaction_enabled = self.config.get('redact_pii_in_samples', False)
+        
         if columns_with_samples > 0:
-            logger.info(f"📊 Column batch prompt includes sample data for {columns_with_samples}/{len(columns)} columns")
+            if redaction_enabled:
+                logger.info(f"📊 Column batch prompt includes sample data for {columns_with_samples}/{len(columns)} columns (🔒 REDACTED for privacy)")
+            else:
+                logger.info(f"📊 Column batch prompt includes sample data for {columns_with_samples}/{len(columns)} columns")
         else:
             # Provide context-specific message based on whether sampling is enabled
             if not self.config.get('enable_sampling', True):
@@ -1026,8 +1086,10 @@ DO NOT mention specific column names or sample values - use them only to underst
         
         pii_analyses_by_column = {}
         if pii_enabled:
-            # Single batch call for all columns
-            pii_results = self.pii_detector.analyze_columns_batch(columns)
+            # Single batch call for all columns with specified PII model
+            # pii_model is passed from the outer scope (generate_enhanced_metadata method)
+            pii_model_to_use = getattr(self, '_current_pii_model', None)
+            pii_results = self.pii_detector.analyze_columns_batch(columns, llm_model=pii_model_to_use)
             for col, pii_result in zip(columns, pii_results):
                 pii_analyses_by_column[col['column_name']] = pii_result
         
@@ -1087,10 +1149,24 @@ DO NOT mention specific column names or sample values - use them only to underst
         return results
     
     def _build_schema_prompt(self, context: Dict, style: str) -> str:
-        """Build concise prompt for schema description"""
+        """Build prompt for schema description using configured length"""
         schema_name = context['schema_name']
         table_names = context.get('table_names', [])
         table_count = context.get('table_count', 0)
+        
+        # Get length setting for schemas
+        prompt_config = self._get_prompt_config()
+        length_config = prompt_config.get('description_length', {})
+        if isinstance(length_config, dict):
+            schema_length = length_config.get('schema', 'detailed')
+        else:
+            schema_length = length_config  # Legacy
+        
+        length_guidance = {
+            'concise': "2-3 sentences",
+            'standard': "3-4 sentences",
+            'detailed': "4-5 sentences with comprehensive context"
+        }
         
         # Build table context for business purpose inference
         if table_names:
@@ -1101,7 +1177,7 @@ DO NOT mention specific column names or sample values - use them only to underst
             table_context = f"- Contains {table_count} tables (names not available)"
         
         base_prompt = f"""
-Generate a CONCISE description for the database schema '{schema_name}' in exactly 2-4 sentences.
+Generate a description for the database schema '{schema_name}' in {length_guidance.get(schema_length, length_guidance['detailed'])}.
 
 Context:
 - Schema: {schema_name}
@@ -1171,11 +1247,25 @@ Generate a business-focused description that explains the domain purpose without
         return cleaned
     
     def _build_table_prompt(self, context: Dict, style: str) -> str:
-        """Build enhanced prompt for table description with PII awareness"""
+        """Build prompt for table description using configured length"""
         table_name = context['table_name']
         column_names = context.get('column_names', [])
         pii_analysis = context.get('pii_analysis')
         column_samples = context.get('column_samples', [])
+        
+        # Get length setting for tables
+        prompt_config = self._get_prompt_config()
+        length_config = prompt_config.get('description_length', {})
+        if isinstance(length_config, dict):
+            table_length = length_config.get('table', 'standard')
+        else:
+            table_length = length_config  # Legacy
+        
+        length_guidance = {
+            'concise': "2-3 sentences",
+            'standard': "3-4 sentences",
+            'detailed': "4-5 sentences with comprehensive context"
+        }
         
         # Build column context for business purpose inference
         if column_names:
@@ -1186,7 +1276,7 @@ Generate a business-focused description that explains the domain purpose without
             column_context = f"- Contains {len(column_names)} columns (names not available)"
         
         base_prompt = f"""
-Generate a CONCISE description for the table '{table_name}' in exactly 2-3 sentences.
+Generate a description for the table '{table_name}' in {length_guidance.get(table_length, length_guidance['standard'])}.
 
 Context:
 - Table: {table_name}
@@ -1238,6 +1328,30 @@ Generate a business-focused description that explains what the data is used for.
 """
         return base_prompt.strip()
     
+    def _get_prompt_config(self) -> dict:
+        """Get prompt configuration from settings"""
+        try:
+            if self.settings_manager:
+                settings = self.settings_manager.get_settings()
+                if settings and 'prompt_config' in settings:
+                    return settings['prompt_config']
+        except Exception as e:
+            logger.warning(f"Failed to load prompt config, using defaults: {e}")
+        
+        # Return defaults if loading fails
+        return {
+            'custom_terminology': {},
+            'additional_instructions': '',
+            'description_length': {
+                'schema': 'detailed',
+                'table': 'standard',
+                'column': 'concise'
+            },
+            'include_technical_details': True,
+            'include_business_context': True,
+            'custom_examples': []
+        }
+    
     def _build_column_batch_prompt(self, context: Dict, style: str) -> str:
         """Build batch prompt for multiple columns with sample data awareness"""
         table_name = context['table_name']
@@ -1252,11 +1366,16 @@ Generate professional descriptions for the following columns in table '{table_na
             sample_values = col.get('sample_values', [])
             
             # Format sample values (with optional redaction)
+            should_redact = self.config.get('redact_pii_in_samples', False)
+            
             if sample_values:
                 samples_preview = []
                 for v in sample_values[:3]:  # Show up to 3 samples
                     if v is None:
                         samples_preview.append('NULL')
+                    elif should_redact:
+                        # Redact all sample values when enabled
+                        samples_preview.append('<REDACTED>')
                     else:
                         v_str = str(v)
                         if len(v_str) > 50:
@@ -1273,47 +1392,132 @@ Generate professional descriptions for the following columns in table '{table_na
 
 """
         
-        prompt += f"""
-For each column, provide a single professional sentence describing:
-- What data it stores (infer from column name AND sample values)
-- Its purpose in the table
-- Any business significance
-
-Style: {style}
-Format: Return exactly {len(columns)} descriptions, one per line, numbered.
-Do not mention specific sample values in descriptions - use them only to understand the data patterns.
-"""
+        # Load custom prompt configuration
+        prompt_config = self._get_prompt_config()
+        
+        # Build requirements section based on config
+        prompt += "\nFor each column, provide a description that includes:"
+        
+        if prompt_config.get('include_technical_details', True):
+            prompt += "\n- What data it stores (technical details: infer from column name, data type, AND sample values)"
+        else:
+            prompt += "\n- What data it stores (infer from column name AND sample values)"
+        
+        if prompt_config.get('include_business_context', True):
+            prompt += "\n- Its business purpose and significance in the organization"
+        else:
+            prompt += "\n- Its purpose in the table"
+        
+        # Length guidance based on config
+        length_guidance = {
+            'concise': "Keep descriptions brief and to the point (1 sentence, ~20-30 words).",
+            'standard': "Provide clear, professional descriptions (1-2 sentences, ~30-50 words).",
+            'detailed': "Generate comprehensive descriptions with full context (2-3 sentences, ~50-80 words)."
+        }
+        
+        # Extract column-specific length (handle both dict and legacy string format)
+        length_config = prompt_config.get('description_length', 'standard')
+        if isinstance(length_config, dict):
+            description_length = length_config.get('column', 'concise')
+        else:
+            description_length = length_config  # Legacy format
+        
+        prompt += f"\n\nStyle: {style}"
+        prompt += f"\nLength: {length_guidance.get(description_length, length_guidance['standard'])}"
+        
+        # Add custom terminology if defined
+        custom_terminology = prompt_config.get('custom_terminology', {})
+        if custom_terminology:
+            prompt += "\n\nIMPORTANT TERMINOLOGY:"
+            for term, meaning in custom_terminology.items():
+                prompt += f"\n- '{term}' means '{meaning}'"
+        
+        # Add additional custom instructions if provided
+        additional_instructions = prompt_config.get('additional_instructions', '').strip()
+        if additional_instructions:
+            prompt += f"\n\nADDITIONAL REQUIREMENTS:\n{additional_instructions}"
+        
+        prompt += f"\n\nFormat: Return exactly {len(columns)} descriptions, one per line, numbered."
+        prompt += "\nDo not mention specific sample values in descriptions - use them only to understand the data patterns."
         
         return prompt.strip()
     
     def _parse_batch_response(self, response: str, columns: List[Dict]) -> List[str]:
-        """Parse LLM batch response into individual descriptions"""
+        """Parse LLM batch response into individual descriptions (handles nested/multi-line responses)"""
         if not response or not columns:
             return []
         
-        # Try to split by numbered lines
         lines = response.strip().split('\n')
         descriptions = []
+        current_column_text = ""
+        in_column_block = False
         
         for line in lines:
             line = line.strip()
-            if line and (line[0].isdigit() or line.startswith('-') or line.startswith('*')):
-                # Remove numbering/bullets
-                clean_line = re.sub(r'^\d+\.?\s*', '', line)
-                clean_line = re.sub(r'^[-*]\s*', '', clean_line)
-                if clean_line:
-                    descriptions.append(clean_line.strip())
+            if not line:
+                continue
+            
+            # Check if this line starts a new MAIN column item (e.g., "1. **Column ABC1**", "1. Column: ABC1")
+            # Match both "Column:" and "Column " formats
+            if re.match(r'^\d+\.\s+(\*\*)?Column[:\s]', line):
+                # Save previous column description if exists
+                if current_column_text:
+                    # Extract only the FIRST sentence/sub-item as the description
+                    first_desc = self._extract_first_description(current_column_text)
+                    descriptions.append(first_desc)
+                
+                # Start new column block - extract column name and any following text
+                current_column_text = re.sub(r'^\d+\.\s+', '', line)
+                # Remove markdown bold wrappers (e.g., "**Column ABC1**" -> "Column ABC1")
+                current_column_text = re.sub(r'^\*\*Column[:\s]([^*]+)\*\*', r'Column \1', current_column_text)
+                # Remove "Column: name" or "Column name" prefix
+                current_column_text = re.sub(r'^Column[:\s]+\w+\s*', '', current_column_text)
+                in_column_block = True
+                logger.debug(f"📝 Found column block, extracted text: {current_column_text[:100]}...")
+            elif in_column_block:
+                # Accumulate all text under this column (including sub-items)
+                current_column_text += " " + line
         
-        # If parsing failed, split by sentences
-        if len(descriptions) < len(columns):
-            sentences = response.replace('\n', ' ').split('.')
-            descriptions = [s.strip() + '.' for s in sentences if s.strip()]
+        # Don't forget the last column
+        if current_column_text:
+            first_desc = self._extract_first_description(current_column_text)
+            descriptions.append(first_desc)
+        
+        # If we didn't find column blocks, try the old simple numbered parsing
+        if len(descriptions) == 0:
+            logger.warning(f"⚠️ No column blocks found, trying simple numbered parsing")
+            current_desc = ""
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if re.match(r'^\d+\.\s+', line) and not re.match(r'^\s+\d+\.', line):  # Top-level numbers only
+                    if current_desc:
+                        descriptions.append(current_desc.strip())
+                    current_desc = re.sub(r'^\d+\.\s+', '', line)
+                else:
+                    if current_desc:
+                        current_desc += " " + line
+            if current_desc:
+                descriptions.append(current_desc.strip())
         
         # Ensure we have enough descriptions
-        while len(descriptions) < len(columns):
-            descriptions.append(f"Contains {columns[len(descriptions)]['column_name'].replace('_', ' ')} information.")
+        if len(descriptions) < len(columns):
+            logger.warning(f"⚠️ Parsed only {len(descriptions)} descriptions from LLM, expected {len(columns)}.")
+            while len(descriptions) < len(columns):
+                descriptions.append(f"Contains {columns[len(descriptions)]['column_name'].replace('_', ' ')} information.")
         
         return descriptions[:len(columns)]
+    
+    def _extract_first_description(self, text: str) -> str:
+        """Extract the first meaningful description from potentially nested text"""
+        # Look for the first numbered sub-item (e.g., "1. This column stores...")
+        match = re.search(r'\s*\d+\.\s+(.+?)(?:\s+\d+\.|$)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        # If no sub-items, return the whole text (cleaned)
+        return text.strip()
     
     def _parse_batch_descriptions(self, response: Any, expected_count: int) -> List[str]:
         """Parse batch LLM response into individual descriptions"""
@@ -1455,9 +1659,13 @@ Do not mention specific sample values in descriptions - use them only to underst
         Get table column metadata (names, types) WITHOUT sampling data.
         
         Used for: Table-level description generation (fast, no data access needed)
+        Limits to max_table_context_columns to prevent wide table slowdown.
         """
         try:
             full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+            
+            # Cap columns at configured limit for table context (prevents wide table slowdown)
+            max_cols = self.config.get('max_table_context_columns', 50)
             
             # Get column metadata from information_schema (no data sampling)
             columns_sql = f"""
@@ -1467,6 +1675,7 @@ Do not mention specific sample values in descriptions - use them only to underst
                     AND table_schema = '{schema_name}'
                     AND table_name = '{table_name}'
                 ORDER BY ordinal_position
+                LIMIT {max_cols}
             """
             
             columns_metadata = self.unity_service._execute_sql_warehouse(columns_sql)
@@ -1486,7 +1695,10 @@ Do not mention specific sample values in descriptions - use them only to underst
                 for row in columns_metadata
             ]
             
-            logger.info(f"✅ Retrieved {len(columns)} column names for {full_table_name} (no data sampling)")
+            if len(columns) >= max_cols:
+                logger.info(f"✅ Retrieved {len(columns)} column names for {full_table_name} (capped at {max_cols} for table context, no data sampling)")
+            else:
+                logger.info(f"✅ Retrieved {len(columns)} column names for {full_table_name} (no data sampling)")
             return columns
             
         except Exception as e:
@@ -1511,9 +1723,11 @@ Do not mention specific sample values in descriptions - use them only to underst
                 return await self._get_table_columns_metadata(catalog_name, schema_name, table_name)
             
             sample_rows = self.config.get('sample_rows', 10)
-            logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for column analysis")
+            # Cap columns at configured limit to prevent wide table slowdown
+            max_cols = self.config.get('max_table_context_columns', 50)
+            logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for column analysis (max {max_cols} columns)")
             
-            # Get column metadata from information_schema
+            # Get column metadata from information_schema (capped for wide tables)
             columns_sql = f"""
                 SELECT column_name, data_type, comment
                 FROM system.information_schema.columns
@@ -1521,6 +1735,7 @@ Do not mention specific sample values in descriptions - use them only to underst
                     AND table_schema = '{schema_name}'
                     AND table_name = '{table_name}'
                 ORDER BY ordinal_position
+                LIMIT {max_cols}
             """
             
             columns_metadata = self.unity_service._execute_sql_warehouse(columns_sql)
@@ -1571,7 +1786,10 @@ Do not mention specific sample values in descriptions - use them only to underst
                     'sample_values': sample_values[:10]  # Limit to 10 samples for analysis
                 })
             
-            logger.info(f"✅ Sampled {len(columns_with_samples)} columns with data from {full_table_name}")
+            if len(columns_with_samples) >= max_cols:
+                logger.info(f"✅ Sampled {len(columns_with_samples)} columns with data from {full_table_name} (capped at {max_cols} to prevent wide table slowdown)")
+            else:
+                logger.info(f"✅ Sampled {len(columns_with_samples)} columns with data from {full_table_name}")
             return columns_with_samples
             
         except Exception as e:
@@ -1597,16 +1815,30 @@ Do not mention specific sample values in descriptions - use them only to underst
         full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
         
         sample_rows = self.config.get('sample_rows', 10)
-        logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for {len(columns)} columns")
+        max_cols = self.config.get('max_table_context_columns', 50)
+        
+        # OPTIMIZATION: Only sample the columns we need to enrich, not the entire table
+        # Extract the column names we actually need to sample
+        columns_to_sample = [col['column_name'] for col in columns]
+        
+        # Cap at max_table_context_columns to prevent wide table slowdown
+        if len(columns_to_sample) > max_cols:
+            logger.warning(f"⚠️ Requested {len(columns_to_sample)} columns to sample, capping at {max_cols} for performance")
+            columns_to_sample = columns_to_sample[:max_cols]
+            columns = columns[:max_cols]  # Also truncate the input list to match
+        
+        logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for {len(columns_to_sample)} columns")
         
         try:
-            # Get column names in the correct order from information_schema first
+            # Get column names in the correct order from information_schema
+            # Only fetch the columns we need, in their ordinal position order
             columns_sql = f"""
                 SELECT column_name
                 FROM system.information_schema.columns
                 WHERE table_catalog = '{catalog_name}'
                     AND table_schema = '{schema_name}'
                     AND table_name = '{table_name}'
+                    AND column_name IN ({','.join([f"'{col}'" for col in columns_to_sample])})
                 ORDER BY ordinal_position
             """
             
@@ -1621,11 +1853,11 @@ Do not mention specific sample values in descriptions - use them only to underst
                 logger.warning(f"No columns found in information_schema for {full_table_name}")
                 return columns
             
-            # Build SELECT query with explicit column order to guarantee correct mapping
+            # Build SELECT query ONLY for the columns we need (much more efficient for wide tables)
             columns_list = ', '.join([f"`{col}`" for col in ordered_column_names])
             sample_sql = f"SELECT {columns_list} FROM {full_table_name} LIMIT {sample_rows}"
             
-            logger.info(f"📊 Sample query: SELECT {len(ordered_column_names)} columns FROM {full_table_name} LIMIT {sample_rows}")
+            logger.info(f"📊 Optimized sample query: SELECT {len(ordered_column_names)} columns FROM {full_table_name} LIMIT {sample_rows}")
             
             try:
                 sample_data = self.unity_service._execute_sql_warehouse(sample_sql)

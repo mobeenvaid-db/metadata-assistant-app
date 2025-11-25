@@ -32,20 +32,19 @@ class SettingsManager:
         self.default_settings = {
             "models": {
                 "enabled_models": [
-                    "databricks-gpt-oss-120b",
+                    "databricks-gpt-oss-20b",
                     "databricks-claude-sonnet-4", 
-                    "databricks-meta-llama-3-3-70b-instruct",
+                    "databricks-meta-llama-3-1-8b-instruct",
                     "databricks-gemma-3-12b"
                 ],
                 "custom_models": [],
-                "default_model": "databricks-gpt-oss-120b"
+                "default_model": "databricks-gpt-oss-20b"
             },
             "pii_detection": {
                 "enabled": True,
                 "custom_patterns": [],
                 "llm_assessment_enabled": True,
                 "llm_detection_enabled": True,
-                "llm_model": "databricks-gemma-3-12b",
                 "severity_weights": {
                     "high": 10,
                     "medium": 5, 
@@ -70,6 +69,18 @@ class SettingsManager:
                 "estimated_tokens_per_schema": 150,  # Rough estimate including context
                 "estimated_tokens_per_table": 300,   # Includes columns and samples
                 "estimated_tokens_per_column": 100   # Includes samples and context
+            },
+            "prompt_config": {
+                "custom_terminology": {},  # e.g., {"widget": "product", "acme_id": "customer identifier"}
+                "additional_instructions": "",  # Custom instructions appended to prompts
+                "description_length": {
+                    "schema": "detailed",    # Schemas: "concise", "standard", "detailed"
+                    "table": "standard",     # Tables: "concise", "standard", "detailed"
+                    "column": "concise"      # Columns: "concise", "standard", "detailed"
+                },
+                "include_technical_details": True,  # Include data types, constraints, etc.
+                "include_business_context": True,  # Emphasize business significance
+                "custom_examples": []  # Optional: User-provided examples of good descriptions
             },
             "metadata": {
                 "created_at": datetime.now().isoformat(),
