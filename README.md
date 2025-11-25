@@ -2,15 +2,6 @@
 
 A production-ready Databricks app for AI-powered metadata generation, PII detection, and governance analytics. Fully self-contained with zero external dependencies.
 
-## Versions
-
-This repository includes two application versions:
-
-- **React Version (Recommended)**: `app_react.py` + `app_react.yaml` - Modern React frontend with enhanced UI/UX
-- **Legacy Version**: `app.py` + `app.yaml` - Original Flask application with embedded frontend
-
-Both versions share the same backend infrastructure (Python files, requirements). The React version is recommended for new deployments.
-
 ## Required Permissions
 
 ### Unity Catalog Permissions
