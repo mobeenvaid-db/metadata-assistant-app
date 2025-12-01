@@ -573,12 +573,9 @@ class EnhancedMetadataGenerator:
         
         logger.info(f"📦 Batch generating descriptions for {len(schemas)} schemas")
         
-        # Build batch prompt with context for all schemas
-        batch_prompt = f"""Generate professional descriptions for these {len(schemas)} database schemas:
-
-"""
-        
-        for i, schema_info in enumerate(schemas, 1):
+        # Build context for each schema
+        schema_contexts = []
+        for schema_info in schemas:
             schema_name = schema_info['name']
             
             # Get table names for context
@@ -588,19 +585,34 @@ class EnhancedMetadataGenerator:
             except:
                 table_names = []
             
-            table_context = f" | Tables: {', '.join(table_names[:5])}" if table_names else ""
-            batch_prompt += f"{i}. {schema_name} ({len(table_names)} tables){table_context}\n"
+            schema_contexts.append({
+                'schema_name': schema_name,
+                'catalog_name': catalog_name,
+                'table_count': len(table_names),
+                'table_names': table_names
+            })
         
-        batch_prompt += f"""
-For each schema, provide a 2-4 sentence description explaining:
-- What business domain or process it supports
-- The types of data it contains (infer from schema name and table names)
-- Its role in the overall data architecture
-
-Style: {style}
-Format: Return EXACTLY {len(schemas)} descriptions, one per line, numbered (1., 2., etc.)
-DO NOT mention specific table names in descriptions - use them only to understand the domain.
-"""
+        # For single schema, use the individual prompt builder directly (respects all custom settings)
+        if len(schemas) == 1:
+            batch_prompt = self._build_schema_prompt(schema_contexts[0], style)
+        else:
+            # For multiple schemas, build a batch prompt with custom settings
+            batch_prompt = f"""Generate professional descriptions for these {len(schemas)} database schemas:\n\n"""
+            
+            for i, context in enumerate(schema_contexts, 1):
+                table_context = f" | Tables: {', '.join(context['table_names'][:5])}" if context['table_names'] else ""
+                batch_prompt += f"{i}. {context['schema_name']} ({context['table_count']} tables){table_context}\n"
+            
+            batch_prompt += "\n"
+            
+            # Get the configured prompt template (includes length, terminology, instructions)
+            template_prompt = self._build_schema_prompt(schema_contexts[0], style)
+            
+            # Extract the requirements and formatting from the template
+            # (everything after the "Context:" section)
+            if "Requirements:" in template_prompt:
+                requirements_section = template_prompt.split("Requirements:")[1]
+                batch_prompt += "Requirements:" + requirements_section
         
         # Validate prompt size - if too large, recursively split
         if not self._validate_prompt_size(batch_prompt, len(schemas), 'schema'):
@@ -828,34 +840,36 @@ DO NOT mention specific table names in descriptions - use them only to understan
             
             table_contexts.append(context)
         
-        # Build batch prompt
-        batch_prompt = f"""Generate professional descriptions for these {len(tables)} database tables:
-
-"""
-        
-        for i, ctx in enumerate(table_contexts, 1):
-            col_names_str = ', '.join(ctx['column_names'][:5])
+        # For single table, use the individual prompt builder directly (respects all custom settings)
+        if len(tables) == 1:
+            batch_prompt = self._build_table_prompt(table_contexts[0], style)
+        else:
+            # For multiple tables, build a batch prompt with custom settings
+            batch_prompt = f"""Generate professional descriptions for these {len(tables)} database tables:\n\n"""
             
-            sample_info = ""
-            if ctx.get('column_samples'):
-                sample_preview = []
-                for col_sample in ctx['column_samples'][:3]:  # Show 3 sample columns
-                    samples_str = ', '.join([f"'{v}'" for v in col_sample['sample_values'][:2]])
-                    sample_preview.append(f"{col_sample['column_name']}: {samples_str}")
-                sample_info = f" | Samples: {'; '.join(sample_preview)}"
+            for i, ctx in enumerate(table_contexts, 1):
+                col_names_str = ', '.join(ctx['column_names'][:5])
+                
+                sample_info = ""
+                if ctx.get('column_samples'):
+                    sample_preview = []
+                    for col_sample in ctx['column_samples'][:3]:  # Show 3 sample columns
+                        samples_str = ', '.join([f"'{v}'" for v in col_sample['sample_values'][:2]])
+                        sample_preview.append(f"{col_sample['column_name']}: {samples_str}")
+                    sample_info = f" | Samples: {'; '.join(sample_preview)}"
+                
+                batch_prompt += f"{i}. {ctx['schema_name']}.{ctx['table_name']} ({ctx['column_count']} columns: {col_names_str}){sample_info}\n"
             
-            batch_prompt += f"{i}. {ctx['schema_name']}.{ctx['table_name']} ({ctx['column_count']} columns: {col_names_str}){sample_info}\n"
-        
-        batch_prompt += f"""
-For each table, provide a 2-3 sentence description explaining:
-- What business entity or process this table represents
-- The purpose of the data it stores (infer from table name, column names, and sample values)
-- Any notable data characteristics
-
-Style: {style}
-Format: Return EXACTLY {len(tables)} descriptions, one per line, numbered (1., 2., etc.)
-DO NOT mention specific column names or sample values - use them only to understand the data patterns.
-"""
+            batch_prompt += "\n"
+            
+            # Get the configured prompt template (includes length, terminology, instructions)
+            template_prompt = self._build_table_prompt(table_contexts[0], style)
+            
+            # Extract the requirements and formatting from the template
+            # (everything after the "Context:" section)
+            if "Requirements:" in template_prompt:
+                requirements_section = template_prompt.split("Requirements:")[1]
+                batch_prompt += "Requirements:" + requirements_section
         
         # Validate prompt size - if too large, recursively split
         if not self._validate_prompt_size(batch_prompt, len(tables), 'table'):
@@ -1163,10 +1177,12 @@ DO NOT mention specific column names or sample values - use them only to underst
             schema_length = length_config  # Legacy
         
         length_guidance = {
-            'concise': "2-3 sentences",
-            'standard': "3-4 sentences",
-            'detailed': "4-5 sentences with comprehensive context"
+            'concise': "1-2 sentences, brief and direct",
+            'standard': "2-3 sentences with context",
+            'detailed': "3-4 sentences with comprehensive business context and domain significance"
         }
+        
+        logger.info(f"📏 Schema length setting: '{schema_length}' -> {length_guidance.get(schema_length, length_guidance['detailed'])}")
         
         # Build table context for business purpose inference
         if table_names:
@@ -1200,7 +1216,26 @@ Business Domain Inference Examples:
 - Tables like "transactions", "accounts", "balances" → Focus on financial services and banking
 
 Generate a business-focused description that explains the domain purpose without mentioning specific tables.
+
+OUTPUT FORMAT:
+Return ONLY the description as plain text, starting directly with the content. Do NOT number it, do NOT add prefixes like "Description:" or preamble text.
+Example: "The schema serves as a centralized repository for customer relationship data, supporting sales operations and customer service workflows across the organization..."
 """
+        
+        # Add custom terminology if defined
+        custom_terminology = prompt_config.get('custom_terminology', {})
+        if custom_terminology:
+            base_prompt += "\n\nIMPORTANT TERMINOLOGY:"
+            for term, meaning in custom_terminology.items():
+                base_prompt += f"\n- '{term}' means '{meaning}'"
+            logger.info(f"🔤 Added {len(custom_terminology)} custom terminology mappings to schema prompt")
+        
+        # Add additional custom instructions if provided
+        additional_instructions = prompt_config.get('additional_instructions', '').strip()
+        if additional_instructions:
+            base_prompt += f"\n\nADDITIONAL REQUIREMENTS:\n{additional_instructions}"
+            logger.info(f"📝 Added custom instructions to schema prompt: {additional_instructions[:100]}{'...' if len(additional_instructions) > 100 else ''}")
+        
         return base_prompt.strip()
     
     def _sanitize_description(self, description: str) -> str:
@@ -1262,10 +1297,12 @@ Generate a business-focused description that explains the domain purpose without
             table_length = length_config  # Legacy
         
         length_guidance = {
-            'concise': "2-3 sentences",
-            'standard': "3-4 sentences",
-            'detailed': "4-5 sentences with comprehensive context"
+            'concise': "1-2 sentences, brief and direct",
+            'standard': "2-3 sentences with context",
+            'detailed': "3-4 sentences with comprehensive business context and domain significance"
         }
+        
+        logger.info(f"📏 Table length setting: '{table_length}' -> {length_guidance.get(table_length, length_guidance['standard'])}")
         
         # Build column context for business purpose inference
         if column_names:
@@ -1325,7 +1362,26 @@ Business Purpose Inference Examples:
 - Product data → "Contains product catalog for inventory management"
 
 Generate a business-focused description that explains what the data is used for.
+
+OUTPUT FORMAT:
+Return ONLY the description as plain text, starting directly with the content. Do NOT number it, do NOT add prefixes like "Description:" or preamble text.
+Example: "The table stores customer transaction data including purchase amounts and dates, supporting financial reporting and revenue analysis processes..."
 """
+        
+        # Add custom terminology if defined
+        custom_terminology = prompt_config.get('custom_terminology', {})
+        if custom_terminology:
+            base_prompt += "\n\nIMPORTANT TERMINOLOGY:"
+            for term, meaning in custom_terminology.items():
+                base_prompt += f"\n- '{term}' means '{meaning}'"
+            logger.info(f"🔤 Added {len(custom_terminology)} custom terminology mappings to table prompt")
+        
+        # Add additional custom instructions if provided
+        additional_instructions = prompt_config.get('additional_instructions', '').strip()
+        if additional_instructions:
+            base_prompt += f"\n\nADDITIONAL REQUIREMENTS:\n{additional_instructions}"
+            logger.info(f"📝 Added custom instructions to table prompt: {additional_instructions[:100]}{'...' if len(additional_instructions) > 100 else ''}")
+        
         return base_prompt.strip()
     
     def _get_prompt_config(self) -> dict:
@@ -1334,11 +1390,17 @@ Generate a business-focused description that explains what the data is used for.
             if self.settings_manager:
                 settings = self.settings_manager.get_settings()
                 if settings and 'prompt_config' in settings:
-                    return settings['prompt_config']
+                    config = settings['prompt_config']
+                    # Debug logging to show what configuration is being used
+                    logger.info(f"🎯 Using custom prompt config: length={config.get('description_length')}, terminology={len(config.get('custom_terminology', {}))} terms, instructions={'Yes' if config.get('additional_instructions') else 'No'}")
+                    if config.get('custom_terminology'):
+                        logger.info(f"🔤 Custom terminology: {config['custom_terminology']}")
+                    return config
         except Exception as e:
             logger.warning(f"Failed to load prompt config, using defaults: {e}")
         
         # Return defaults if loading fails
+        logger.info("🎯 Using default prompt config (no custom settings found)")
         return {
             'custom_terminology': {},
             'additional_instructions': '',
@@ -1410,9 +1472,9 @@ Generate professional descriptions for the following columns in table '{table_na
         
         # Length guidance based on config
         length_guidance = {
-            'concise': "Keep descriptions brief and to the point (1 sentence, ~20-30 words).",
+            'concise': "Keep descriptions very brief and direct (1 short sentence, ~15-25 words).",
             'standard': "Provide clear, professional descriptions (1-2 sentences, ~30-50 words).",
-            'detailed': "Generate comprehensive descriptions with full context (2-3 sentences, ~50-80 words)."
+            'detailed': "Generate comprehensive descriptions with full business context and technical details (2-3 sentences, ~60-100 words)."
         }
         
         # Extract column-specific length (handle both dict and legacy string format)
@@ -1423,7 +1485,9 @@ Generate professional descriptions for the following columns in table '{table_na
             description_length = length_config  # Legacy format
         
         prompt += f"\n\nStyle: {style}"
-        prompt += f"\nLength: {length_guidance.get(description_length, length_guidance['standard'])}"
+        length_instruction = length_guidance.get(description_length, length_guidance['standard'])
+        prompt += f"\nLength: {length_instruction}"
+        logger.info(f"📏 Applied length setting '{description_length}': {length_instruction}")
         
         # Add custom terminology if defined
         custom_terminology = prompt_config.get('custom_terminology', {})
@@ -1431,14 +1495,21 @@ Generate professional descriptions for the following columns in table '{table_na
             prompt += "\n\nIMPORTANT TERMINOLOGY:"
             for term, meaning in custom_terminology.items():
                 prompt += f"\n- '{term}' means '{meaning}'"
+            logger.info(f"🔤 Added {len(custom_terminology)} custom terminology mappings to prompt")
         
         # Add additional custom instructions if provided
         additional_instructions = prompt_config.get('additional_instructions', '').strip()
         if additional_instructions:
             prompt += f"\n\nADDITIONAL REQUIREMENTS:\n{additional_instructions}"
+            logger.info(f"📝 Added custom instructions to prompt: {additional_instructions[:100]}{'...' if len(additional_instructions) > 100 else ''}")
         
-        prompt += f"\n\nFormat: Return exactly {len(columns)} descriptions, one per line, numbered."
+        prompt += f"\n\nOUTPUT FORMAT:"
+        prompt += f"\nReturn exactly {len(columns)} descriptions, numbered 1-{len(columns)}."
+        prompt += "\nDo NOT add preamble text, headers, or labels like 'Description:' or 'Column:'."
         prompt += "\nDo not mention specific sample values in descriptions - use them only to understand the data patterns."
+        prompt += "\n\nExample format:"
+        prompt += "\n1. Stores the unique identifier for..."
+        prompt += "\n2. Represents the customer's primary..."
         
         return prompt.strip()
     
@@ -1514,13 +1585,21 @@ Generate professional descriptions for the following columns in table '{table_na
         # Look for the first numbered sub-item (e.g., "1. This column stores...")
         match = re.search(r'\s*\d+\.\s+(.+?)(?:\s+\d+\.|$)', text, re.DOTALL)
         if match:
-            return match.group(1).strip()
+            result = match.group(1).strip()
+        else:
+            # If no sub-items, return the whole text (cleaned)
+            result = text.strip()
         
-        # If no sub-items, return the whole text (cleaned)
-        return text.strip()
+        # Remove common prefixes that LLMs add
+        result = re.sub(r'^Description:\s*', '', result, flags=re.IGNORECASE)
+        result = re.sub(r'^Column\s+Description:\s*', '', result, flags=re.IGNORECASE)
+        
+        return result.strip()
     
     def _parse_batch_descriptions(self, response: Any, expected_count: int) -> List[str]:
         """Parse batch LLM response into individual descriptions"""
+        import re  # Import at function level
+        
         try:
             # Extract text from response
             if isinstance(response, dict):
@@ -1536,30 +1615,41 @@ Generate professional descriptions for the following columns in table '{table_na
             if not response_text:
                 return [f"Description for object {i+1}" for i in range(expected_count)]
             
+            # Special case: For single items, just return the full text (no parsing needed)
+            if expected_count == 1:
+                # Clean up any numbered prefixes that might have been added
+                clean_text = response_text.strip()
+                # Remove leading "1. " if present
+                clean_text = re.sub(r'^1\.\s+', '', clean_text)
+                # Remove "Description:" prefix if present
+                clean_text = re.sub(r'^Description:\s*', '', clean_text, flags=re.IGNORECASE)
+                return [clean_text.strip()]
+            
             # Split by numbered lines (1., 2., etc.)
             lines = response_text.strip().split('\n')
             descriptions = []
             
             current_desc = ""
+            found_first_item = False  # Track if we've found the first numbered item
+            
             for line in lines:
                 line = line.strip()
                 if not line:
                     continue
                 
                 # Check if this is a numbered line
-                import re
                 if re.match(r'^\d+\.\s+', line):
                     # Save previous description if exists
                     if current_desc:
                         descriptions.append(current_desc.strip())
                     # Start new description (remove number)
                     current_desc = re.sub(r'^\d+\.\s+', '', line)
+                    found_first_item = True  # Mark that we've started parsing items
                 else:
-                    # Continue current description
-                    if current_desc:
+                    # Continue current description (but ONLY if we've found the first numbered item)
+                    # This skips preamble text like "Here are the professional descriptions:"
+                    if found_first_item and current_desc:
                         current_desc += " " + line
-                    else:
-                        current_desc = line
             
             # Don't forget the last description
             if current_desc:

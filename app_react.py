@@ -1290,9 +1290,9 @@ def _build_sample_prompt_preview(prompt_config: dict) -> str:
     
     # Length guidance
     length_guidance = {
-        'concise': "Keep descriptions brief and to the point (1 sentence, ~20-30 words).",
+        'concise': "Keep descriptions very brief and direct (1 short sentence, ~15-25 words).",
         'standard': "Provide clear, professional descriptions (1-2 sentences, ~30-50 words).",
-        'detailed': "Generate comprehensive descriptions with full context (2-3 sentences, ~50-80 words)."
+        'detailed': "Generate comprehensive descriptions with full business context and technical details (2-3 sentences, ~60-100 words)."
     }
     
     prompt = f"""Generate professional descriptions for the following columns in table 'sample_table':
