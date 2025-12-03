@@ -3760,13 +3760,17 @@ class LLMMetadataGenerator:
         
         return f"{style_instruction}\n\n{prompt}"
 
-    def _call_databricks_llm(self, prompt: str, max_tokens: int = 150, model: str = None, temperature: float = 0.7, style: str = "concise") -> str:
+    def _call_databricks_llm(self, prompt: str, max_tokens: int = 150, model: str = None, temperature: float = 0.7, style: str = None) -> str:
         """Call Databricks Foundation Model API with multi-model and style support"""
         try:
             token = self._get_oauth_token()
             
-            # Apply style to prompt
-            styled_prompt = self._apply_style_to_prompt(prompt, style)
+            # Apply style to prompt only if explicitly provided (for backward compatibility)
+            # New code uses Prompts settings instead, so style should be None
+            if style:
+                styled_prompt = self._apply_style_to_prompt(prompt, style)
+            else:
+                styled_prompt = prompt
             
             # Use provided model or default
             model_id = model or "databricks-gpt-oss-20b"

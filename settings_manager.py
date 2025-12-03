@@ -82,6 +82,14 @@ class SettingsManager:
                 "include_business_context": True,  # Emphasize business significance
                 "custom_examples": []  # Optional: User-provided examples of good descriptions
             },
+            "generation_mode": {
+                "engine": "uc_assistant",  # "uc_assistant" or "dbxmetagen"
+                "dbxmetagen_config": {
+                    "notebook_path": "/Workspace/Shared/dbxmetagen/notebooks/metadata_generator",
+                    "cluster_id": "",
+                    "variables_yml_path": "/dbfs/dbxmetagen/variables.yml"
+                }
+            },
             "metadata": {
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),

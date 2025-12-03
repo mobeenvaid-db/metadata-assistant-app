@@ -19,6 +19,12 @@ from app import (
     EnhancedMetadataGenerator
 )
 
+# Import metadata copy utilities
+from metadata_copy_utils import MetadataCopyUtils
+
+# Import dbxmetagen adapter
+from dbxmetagen_adapter import DbxMetagenAdapter
+
 # --------------------------- App & Logging -----------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uc-metadata-assistant-react")
@@ -1365,18 +1371,6 @@ def api_generation_options(catalog_name, object_type):
         logger.error(f"Error getting generation options: {e}")
         return jsonify({"error": str(e)}), 500
 
-@flask_app.route("/api/styles")
-def api_styles():
-    """Get available generation styles"""
-    return jsonify({
-        "styles": [
-            {"value": "enterprise", "label": "Enterprise", "description": "Formal, professional tone for business users"},
-            {"value": "technical", "label": "Technical", "description": "Detailed technical specifications"},
-            {"value": "business", "label": "Business", "description": "Business-focused, non-technical language"},
-            {"value": "concise", "label": "Concise", "description": "Brief, to-the-point descriptions"}
-        ]
-    })
-
 # Import generation functionality from main app
 from app import run_async_in_thread, get_enhanced_generator, get_setup_manager
 from datetime import datetime as dt
@@ -1411,7 +1405,7 @@ def api_enhanced_run():
         catalog = body.get("catalog")
         model = body.get("model", "databricks-gpt-oss-20b")
         pii_model = body.get("piiModel", model)  # Default to metadata model if not specified
-        style = body.get("style", "enterprise")
+        # Note: 'style' parameter removed - generation style now controlled via Prompts settings
         selected_objects = body.get("selected_objects", {})
         
         if not catalog:
@@ -1445,10 +1439,21 @@ def api_enhanced_run():
         
         enhanced_generator.set_progress_callback(progress_callback)
         
-        # Start generation in background with PII model
-        generation_future = run_async_in_thread(
-            enhanced_generator.generate_enhanced_metadata(catalog, model, style, selected_objects, run_id, pii_model)
-        )
+        # Start generation in background with PII model (style parameter removed)
+        try:
+            logger.info(f"🚀 About to call generate_enhanced_metadata with: catalog={catalog}, model={model}, run_id={run_id}, pii_model={pii_model}, selected_objects count={selected_objects.get('totalCount', 0)}")
+            generation_future = run_async_in_thread(
+                enhanced_generator.generate_enhanced_metadata(catalog, model, selected_objects, run_id, pii_model)
+            )
+            logger.info(f"✅ Background thread started successfully for {run_id}")
+        except Exception as thread_error:
+            logger.error(f"❌ Failed to start background thread: {thread_error}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return jsonify({
+                "error": f"Failed to start generation: {str(thread_error)}",
+                "success": False
+            }), 500
         
         # Store future for status checking
         if not hasattr(flask_app, 'generation_tasks'):
@@ -1479,7 +1484,6 @@ def api_enhanced_run():
             "catalog": catalog,
             "model": model,
             "pii_model": pii_model,
-            "style": style,
             "status": "Enhanced generation started",
             "timestamp": dt.now().isoformat()
         })
@@ -1570,11 +1574,15 @@ def api_enhanced_status(run_id):
                     return jsonify(flask_app.completed_runs[run_id])
                     
             except Exception as e:
+                logger.error(f"❌ Generation {run_id} failed with error: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 return jsonify({
                     "success": False,
                     "run_id": run_id,
                     "status": "ERROR",
                     "error": str(e),
+                    "traceback": traceback.format_exc(),
                     "timestamp": dt.now().isoformat()
                 })
         else:
@@ -2441,6 +2449,303 @@ def api_commit_status(run_id):
     except Exception as e:
         logger.error(f"Error checking commit status: {e}")
         return jsonify({"error": str(e)}), 500
+
+# --------------------------- Metadata Copy APIs -----------------------------------
+@flask_app.route('/api/metadata/source-objects', methods=['GET'])
+def api_get_source_objects():
+    """Fetch objects WITH descriptions from a catalog"""
+    try:
+        from flask import request
+        catalog = request.args.get('catalog')
+        schema = request.args.get('schema')  # Optional
+        object_type = request.args.get('object_type')  # Optional: schema, table, column
+        
+        if not catalog:
+            return jsonify({"error": "catalog parameter is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.get_objects_with_descriptions(catalog, schema, object_type)
+        
+        return jsonify({
+            "success": True,
+            "catalog": catalog,
+            "schema": schema,
+            "object_type": object_type,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching source objects: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/target-objects/<catalog_name>', methods=['GET'])
+def api_target_objects(catalog_name):
+    """Get target objects WITHOUT descriptions (undocumented objects)"""
+    try:
+        from flask import request
+        schema_name = request.args.get('schema_name')
+        object_type = request.args.get('object_type')  # Optional filter
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.get_objects_without_descriptions(catalog_name, schema_name, object_type)
+        
+        return jsonify({
+            "success": True,
+            "catalog": catalog_name,
+            "schema": schema_name,
+            "object_type": object_type,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching target objects: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/smart-match', methods=['POST'])
+def api_smart_match():
+    """Generate smart matches between source and target objects"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        source_objects = data.get('source_objects', [])
+        target_catalog = data.get('target_catalog')
+        target_schema = data.get('target_schema')  # Optional
+        
+        if not source_objects:
+            return jsonify({"error": "source_objects is required"}), 400
+        if not target_catalog:
+            return jsonify({"error": "target_catalog is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.smart_match_objects(source_objects, target_catalog, target_schema)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in smart matching: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/copy-bulk', methods=['POST'])
+def api_copy_bulk():
+    """Apply bulk metadata copy"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        mappings = data.get('mappings', [])
+        
+        if not mappings:
+            return jsonify({"error": "mappings is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.copy_metadata_bulk(mappings)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in bulk copy: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/export', methods=['POST'])
+def api_export_metadata():
+    """Export metadata to CSV"""
+    try:
+        from flask import request, Response
+        data = request.get_json()
+        
+        catalog = data.get('catalog')
+        schema_names = data.get('schemas', [])
+        table_names = data.get('tables', [])
+        column_names = data.get('columns', [])
+        include_tags = data.get('include_tags', False)
+        
+        if not catalog:
+            return jsonify({"error": "catalog is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        csv_content = copy_utils.export_metadata_csv(
+            catalog,
+            schema_names if schema_names else None,
+            table_names if table_names else None,
+            column_names if column_names else None,
+            include_tags
+        )
+        
+        # Return CSV as downloadable file
+        return Response(
+            csv_content,
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition': f'attachment; filename=metadata_export_{catalog}.csv'
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error exporting metadata: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/import', methods=['POST'])
+def api_import_metadata():
+    """Parse and validate imported CSV"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        csv_content = data.get('csv_content')
+        target_catalog = data.get('target_catalog')  # Now optional
+        
+        if not csv_content:
+            return jsonify({"error": "csv_content is required"}), 400
+        # target_catalog is now optional - if provided, will remap; if not, uses CSV full_name as-is
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.import_metadata_csv(csv_content, target_catalog if target_catalog else None)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error importing metadata: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/import-apply', methods=['POST'])
+def api_import_apply():
+    """Apply imported metadata"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        mappings = data.get('mappings', [])
+        overwrite_existing = data.get('overwrite_existing', False)
+        
+        if not mappings:
+            return jsonify({"error": "mappings is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.apply_imported_metadata(mappings, overwrite_existing)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error applying imported metadata: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------- Generation Mode APIs -----------------------------------
+@flask_app.route('/api/settings/generation-mode', methods=['GET'])
+def api_get_generation_mode():
+    """Get current generation mode settings"""
+    try:
+        settings_manager = get_settings_manager_safe()
+        settings = settings_manager.get_settings()
+        
+        return jsonify({
+            "success": True,
+            "data": settings.get('generation_mode', {
+                'engine': 'uc_assistant',
+                'dbxmetagen_config': {}
+            })
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting generation mode: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/settings/generation-mode', methods=['POST'])
+def api_update_generation_mode():
+    """Update generation mode settings"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        engine = data.get('engine', 'uc_assistant')
+        dbxmetagen_config = data.get('dbxmetagen_config', {})
+        
+        # Validate dbxmetagen config if switching to dbxmetagen
+        if engine == 'dbxmetagen':
+            unity = get_unity_service()
+            adapter = DbxMetagenAdapter(unity.workspace_client, unity)
+            validation = adapter.validate_configuration(dbxmetagen_config)
+            
+            if not validation['valid']:
+                return jsonify({
+                    "success": False,
+                    "errors": validation['errors']
+                }), 400
+        
+        # Update settings
+        settings_manager = get_settings_manager_safe()
+        settings = settings_manager.get_settings()
+        settings['generation_mode'] = {
+            'engine': engine,
+            'dbxmetagen_config': dbxmetagen_config
+        }
+        settings_manager.save_settings(settings)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Generation mode updated to {engine}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error updating generation mode: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/dbxmetagen/validate', methods=['POST'])
+def api_validate_dbxmetagen():
+    """Validate dbxmetagen configuration"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        unity = get_unity_service()
+        adapter = DbxMetagenAdapter(unity.workspace_client, unity)
+        
+        validation = adapter.validate_configuration(data)
+        
+        return jsonify({
+            "success": validation['valid'],
+            "errors": validation['errors']
+        })
+        
+    except Exception as e:
+        logger.error(f"Error validating dbxmetagen config: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 # --------------------------- Health Check -----------------------------------
 @flask_app.route('/api/health')

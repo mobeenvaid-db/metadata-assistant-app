@@ -225,17 +225,18 @@ class EnhancedMetadataGenerator:
             # Use debug level to avoid log spam during generation
             logger.debug(f"Progress callback error: {e}")
     
-    async def generate_enhanced_metadata(self, catalog_name: str, model: str, style: str = 'enterprise', selected_objects: Dict = None, run_id: str = None, pii_model: str = None) -> Dict:
+    async def generate_enhanced_metadata(self, catalog_name: str, model: str, selected_objects: Dict = None, run_id: str = None, pii_model: str = None) -> Dict:
         """
         Generate enhanced metadata for entire catalog with PII detection and data profiling
         
         Args:
             catalog_name: Name of the catalog
             model: LLM model for metadata generation
-            style: Generation style (enterprise, technical, business, concise)
             selected_objects: Dict of selected schemas/tables/columns
             run_id: Unique run identifier
             pii_model: Optional LLM model for PII detection (defaults to metadata model)
+        
+        Note: Generation style is now controlled via Prompts settings in the Settings page
         """
         # Default pii_model to metadata model if not specified
         if not pii_model:
@@ -274,7 +275,6 @@ class EnhancedMetadataGenerator:
             'run_id': run_id,
             'catalog_name': catalog_name,
             'model': model,
-            'style': style,
             'started_at': start_time.isoformat(),
             'config': self.config.copy(),
             'summary': {
@@ -344,7 +344,7 @@ class EnhancedMetadataGenerator:
                     
                     try:
                         batch_metadata = await self._generate_schemas_batch(
-                            schema_batch, catalog_name, model, style, run_id
+                            schema_batch, catalog_name, model, run_id
                         )
                         
                         for metadata in batch_metadata:
@@ -413,7 +413,7 @@ class EnhancedMetadataGenerator:
                     
                     try:
                         batch_metadata = await self._generate_tables_batch(
-                            table_batch, catalog_name, model, style, run_id
+                            table_batch, catalog_name, model, run_id
                         )
                         
                         for metadata in batch_metadata:
@@ -465,7 +465,7 @@ class EnhancedMetadataGenerator:
             
             # Process columns in optimized chunks
             column_results = await self._generate_columns_metadata_chunked(
-                missing_columns, catalog_name, model, style, run_id
+                missing_columns, catalog_name, model, run_id
             )
             
             results['generated_metadata'].extend(column_results['metadata'])
@@ -505,7 +505,7 @@ class EnhancedMetadataGenerator:
         logger.info(f"Enhanced generation complete: {results['summary']}")
         return results
     
-    async def _generate_schema_metadata_enhanced(self, schema_info: Dict, catalog_name: str, model: str, style: str, run_id: str = None) -> Dict:
+    async def _generate_schema_metadata_enhanced(self, schema_info: Dict, catalog_name: str, model: str, run_id: str = None) -> Dict:
         """Generate enhanced schema metadata with context and analysis"""
         schema_name = schema_info['name']
         
@@ -529,15 +529,14 @@ class EnhancedMetadataGenerator:
         }
         
         # Generate description with context
-        prompt = self._build_schema_prompt(context_info, style)
+        prompt = self._build_schema_prompt(context_info)
         
         try:
             description = self.llm_service._call_databricks_llm(
                 prompt=prompt,
                 max_tokens=self.config['max_tokens'],
                 model=model,
-                temperature=self.config['temperature'],
-                style=style
+                temperature=self.config['temperature']
             )
             
             # Debug: Log what we got from LLM service
@@ -560,13 +559,13 @@ class EnhancedMetadataGenerator:
             'policy_tags': [],
             'data_classification': 'INTERNAL',
             'source_model': model,
-            'generation_style': style,
+            'generation_style': 'configured',  # Controlled via Prompts settings
             'context_used': context_info,
             'generated_at': datetime.now().isoformat(),
             'pii_detected': False
         }
     
-    async def _generate_schemas_batch(self, schemas: List[Dict], catalog_name: str, model: str, style: str, run_id: str = None) -> List[Dict]:
+    async def _generate_schemas_batch(self, schemas: List[Dict], catalog_name: str, model: str, run_id: str = None) -> List[Dict]:
         """Generate metadata for multiple schemas in a single LLM call (much more efficient)"""
         if not schemas:
             return []
@@ -594,7 +593,7 @@ class EnhancedMetadataGenerator:
         
         # For single schema, use the individual prompt builder directly (respects all custom settings)
         if len(schemas) == 1:
-            batch_prompt = self._build_schema_prompt(schema_contexts[0], style)
+            batch_prompt = self._build_schema_prompt(schema_contexts[0])
         else:
             # For multiple schemas, build a batch prompt with custom settings
             batch_prompt = f"""Generate professional descriptions for these {len(schemas)} database schemas:\n\n"""
@@ -606,7 +605,7 @@ class EnhancedMetadataGenerator:
             batch_prompt += "\n"
             
             # Get the configured prompt template (includes length, terminology, instructions)
-            template_prompt = self._build_schema_prompt(schema_contexts[0], style)
+            template_prompt = self._build_schema_prompt(schema_contexts[0])
             
             # Extract the requirements and formatting from the template
             # (everything after the "Context:" section)
@@ -619,8 +618,8 @@ class EnhancedMetadataGenerator:
             if len(schemas) > 1:
                 logger.warning(f"⚠️ Batch too large, splitting {len(schemas)} schemas into 2 sub-batches")
                 mid = len(schemas) // 2
-                results1 = await self._generate_schemas_batch(schemas[:mid], catalog_name, model, style, run_id)
-                results2 = await self._generate_schemas_batch(schemas[mid:], catalog_name, model, style, run_id)
+                results1 = await self._generate_schemas_batch(schemas[:mid], catalog_name, model, run_id)
+                results2 = await self._generate_schemas_batch(schemas[mid:], catalog_name, model, run_id)
                 return results1 + results2
             else:
                 logger.error(f"❌ Single schema prompt too large, using fallback description")
@@ -636,7 +635,7 @@ class EnhancedMetadataGenerator:
                     'proposed_policy_tags': [],
                     'data_classification': 'INTERNAL',
                     'source_model': model,
-                    'generation_style': style,
+                    'generation_style': 'configured',  # Controlled via Prompts settings
                     'context_used': {'schema_name': schemas[0]['name']},
                     'pii_analysis': None,
                     'generated_at': datetime.now().isoformat(),
@@ -653,8 +652,7 @@ class EnhancedMetadataGenerator:
                 prompt=batch_prompt,
                 max_tokens=1000,  # More tokens for batch
                 model=model,
-                temperature=self.config['temperature'],
-                style=style
+                temperature=self.config['temperature']
             )
             
             # Parse batch response into individual descriptions
@@ -685,7 +683,7 @@ class EnhancedMetadataGenerator:
                 'proposed_policy_tags': [],
                 'data_classification': 'INTERNAL',
                 'source_model': model,
-                'generation_style': style,
+                'generation_style': 'configured',  # Controlled via Prompts settings
                 'context_used': {'schema_name': schema_name, 'catalog_name': catalog_name},
                 'pii_analysis': None,
                 'generated_at': datetime.now().isoformat(),
@@ -695,7 +693,7 @@ class EnhancedMetadataGenerator:
         logger.info(f"✅ Batch generated {len(results)} schema descriptions")
         return results
     
-    async def _generate_table_metadata_enhanced(self, table_info: Dict, catalog_name: str, model: str, style: str, run_id: str = None) -> Dict:
+    async def _generate_table_metadata_enhanced(self, table_info: Dict, catalog_name: str, model: str, run_id: str = None) -> Dict:
         """Generate enhanced table metadata using column names/types for context.
         
         NOTE: PII detection is NOT performed at table-level. 
@@ -742,15 +740,14 @@ class EnhancedMetadataGenerator:
             logger.info(f"📊 Including sample values for {len(columns_with_samples)} columns in LLM context")
         
         # Generate description with enhanced context
-        prompt = self._build_table_prompt(context_info, style)
+        prompt = self._build_table_prompt(context_info)
         
         try:
             description = self.llm_service._call_databricks_llm(
                 prompt=prompt,
                 max_tokens=self.config['max_tokens'],
                 model=model,
-                temperature=self.config['temperature'],
-                style=style
+                temperature=self.config['temperature']
             )
             
             confidence_score = self._calculate_confidence_score(description, context_info, 'table')
@@ -776,14 +773,14 @@ class EnhancedMetadataGenerator:
             'policy_tags': json.dumps([]),  # Empty for tables
             'data_classification': classification,
             'source_model': model,
-            'generation_style': style,
+            'generation_style': 'configured',  # Controlled via Prompts settings
             'context_used': context_info,
             'pii_analysis': None,  # No PII analysis for tables
             'generated_at': datetime.now().isoformat(),
             'pii_detected': False  # Always False for tables
         }
     
-    async def _generate_tables_batch(self, tables: List[Dict], catalog_name: str, model: str, style: str, run_id: str = None) -> List[Dict]:
+    async def _generate_tables_batch(self, tables: List[Dict], catalog_name: str, model: str, run_id: str = None) -> List[Dict]:
         """Generate metadata for multiple tables in a single LLM call (much more efficient)"""
         if not tables:
             return []
@@ -842,7 +839,7 @@ class EnhancedMetadataGenerator:
         
         # For single table, use the individual prompt builder directly (respects all custom settings)
         if len(tables) == 1:
-            batch_prompt = self._build_table_prompt(table_contexts[0], style)
+            batch_prompt = self._build_table_prompt(table_contexts[0])
         else:
             # For multiple tables, build a batch prompt with custom settings
             batch_prompt = f"""Generate professional descriptions for these {len(tables)} database tables:\n\n"""
@@ -863,7 +860,7 @@ class EnhancedMetadataGenerator:
             batch_prompt += "\n"
             
             # Get the configured prompt template (includes length, terminology, instructions)
-            template_prompt = self._build_table_prompt(table_contexts[0], style)
+            template_prompt = self._build_table_prompt(table_contexts[0])
             
             # Extract the requirements and formatting from the template
             # (everything after the "Context:" section)
@@ -876,8 +873,8 @@ class EnhancedMetadataGenerator:
             if len(tables) > 1:
                 logger.warning(f"⚠️ Batch too large, splitting {len(tables)} tables into 2 sub-batches")
                 mid = len(tables) // 2
-                results1 = await self._generate_tables_batch(tables[:mid], catalog_name, model, style, run_id)
-                results2 = await self._generate_tables_batch(tables[mid:], catalog_name, model, style, run_id)
+                results1 = await self._generate_tables_batch(tables[:mid], catalog_name, model, run_id)
+                results2 = await self._generate_tables_batch(tables[mid:], catalog_name, model, run_id)
                 return results1 + results2
             else:
                 logger.error(f"❌ Single table prompt too large, using fallback description")
@@ -894,7 +891,7 @@ class EnhancedMetadataGenerator:
                     'proposed_policy_tags': '[]',  # Empty for tables
                     'data_classification': 'INTERNAL',  # Default for tables
                     'source_model': model,
-                    'generation_style': style,
+                    'generation_style': 'configured',  # Controlled via Prompts settings
                     'context_used': ctx,
                     'pii_analysis': None,  # No PII analysis for tables
                     'generated_at': datetime.now().isoformat(),
@@ -911,8 +908,7 @@ class EnhancedMetadataGenerator:
                 prompt=batch_prompt,
                 max_tokens=1500,  # More tokens for table batch
                 model=model,
-                temperature=self.config['temperature'],
-                style=style
+                temperature=self.config['temperature']
             )
             
             # Parse batch response
@@ -945,7 +941,7 @@ class EnhancedMetadataGenerator:
                 'proposed_policy_tags': '[]',  # Empty for tables
                 'data_classification': 'INTERNAL',  # Default for tables
                 'source_model': model,
-                'generation_style': style,
+                'generation_style': 'configured',  # Controlled via Prompts settings
                 'context_used': ctx,
                 'pii_analysis': None,  # No PII analysis for tables
                 'generated_at': datetime.now().isoformat(),
@@ -955,7 +951,7 @@ class EnhancedMetadataGenerator:
         logger.info(f"✅ Batch generated {len(results)} table descriptions")
         return results
     
-    async def _generate_columns_metadata_chunked(self, columns: List[Dict], catalog_name: str, model: str, style: str, run_id: str = None) -> Dict:
+    async def _generate_columns_metadata_chunked(self, columns: List[Dict], catalog_name: str, model: str, run_id: str = None) -> Dict:
         """Generate column metadata using intelligent chunking for efficiency"""
         results = {
             'metadata': [],
@@ -998,7 +994,7 @@ class EnhancedMetadataGenerator:
                     
                     try:
                         chunk_results = await self._generate_column_chunk_metadata(
-                            chunk, model, style, run_id
+                            chunk, model, run_id
                         )
                         
                         results['metadata'].extend(chunk_results['metadata'])
@@ -1028,7 +1024,7 @@ class EnhancedMetadataGenerator:
         
         return results
     
-    async def _generate_column_chunk_metadata(self, columns: List[Dict], model: str, style: str, run_id: str = None) -> Dict:
+    async def _generate_column_chunk_metadata(self, columns: List[Dict], model: str, run_id: str = None) -> Dict:
         """Generate metadata for a chunk of columns with shared context"""
         if not columns:
             return {'metadata': [], 'processed': 0, 'pii_detected': 0, 'high_confidence': 0}
@@ -1050,7 +1046,7 @@ class EnhancedMetadataGenerator:
         }
         
         # Build batch prompt for efficiency
-        prompt = self._build_column_batch_prompt(table_context, style)
+        prompt = self._build_column_batch_prompt(table_context)
         
         # Log sample data availability
         columns_with_samples = sum(1 for col in columns if col.get('sample_values'))
@@ -1074,8 +1070,7 @@ class EnhancedMetadataGenerator:
                 prompt=prompt,
                 max_tokens=self.config['max_tokens'] * len(columns),
                 model=model,
-                temperature=self.config['temperature'],
-                style=style
+                temperature=self.config['temperature']
             )
             
             # Parse batch response into individual descriptions
@@ -1141,7 +1136,7 @@ class EnhancedMetadataGenerator:
                     'proposed_policy_tags': json.dumps(proposed_policy_tags),  # New - for manual review
                     'data_classification': classification,
                     'source_model': model,
-                    'generation_style': style,
+                    'generation_style': 'configured',  # Controlled via Prompts settings
                     'context_used': table_context,
                     'pii_analysis': pii_analysis,
                     'generated_at': datetime.now().isoformat(),
@@ -1162,7 +1157,7 @@ class EnhancedMetadataGenerator:
         
         return results
     
-    def _build_schema_prompt(self, context: Dict, style: str) -> str:
+    def _build_schema_prompt(self, context: Dict) -> str:
         """Build prompt for schema description using configured length"""
         schema_name = context['schema_name']
         table_names = context.get('table_names', [])
@@ -1205,7 +1200,7 @@ Requirements:
 - DO NOT mention table names, counts, or list tables in the description
 - Use the table names as intelligence to understand the business domain
 - Explain what business processes and data types this schema supports
-- Professional {style} style
+- Professional, clear tone
 - NO tables, bullet points, or formatting
 - Plain text only
 
@@ -1281,7 +1276,7 @@ Example: "The schema serves as a centralized repository for customer relationshi
         
         return cleaned
     
-    def _build_table_prompt(self, context: Dict, style: str) -> str:
+    def _build_table_prompt(self, context: Dict) -> str:
         """Build prompt for table description using configured length"""
         table_name = context['table_name']
         column_names = context.get('column_names', [])
@@ -1345,7 +1340,7 @@ Requirements:
 - DO NOT mention column names, counts, or list columns in the description
 - Use the column names and sample values as intelligence to understand the data purpose
 - Explain what business entity or process this table represents
-- Professional {style} style
+- Professional, clear tone
 - NO formatting, tables, or bullet points
 - Plain text only
 
@@ -1414,7 +1409,7 @@ Example: "The table stores customer transaction data including purchase amounts 
             'custom_examples': []
         }
     
-    def _build_column_batch_prompt(self, context: Dict, style: str) -> str:
+    def _build_column_batch_prompt(self, context: Dict) -> str:
         """Build batch prompt for multiple columns with sample data awareness"""
         table_name = context['table_name']
         columns = context['columns']
@@ -1484,7 +1479,6 @@ Generate professional descriptions for the following columns in table '{table_na
         else:
             description_length = length_config  # Legacy format
         
-        prompt += f"\n\nStyle: {style}"
         length_instruction = length_guidance.get(description_length, length_guidance['standard'])
         prompt += f"\nLength: {length_instruction}"
         logger.info(f"📏 Applied length setting '{description_length}': {length_instruction}")
