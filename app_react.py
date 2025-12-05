@@ -1371,6 +1371,69 @@ def api_generation_options(catalog_name, object_type):
         logger.error(f"Error getting generation options: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@flask_app.route("/api/improvement-options/<catalog_name>/<object_type>")
+def api_improvement_options(catalog_name, object_type):
+    """Get objects WITH descriptions for improvement/quality scanning"""
+    try:
+        logger.info(f"Getting improvement options for {catalog_name}/{object_type}")
+        
+        # Get unity service instance
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        # Get all described objects
+        described_objects = copy_utils.get_objects_with_descriptions(catalog_name)
+        
+        # Filter by object type and format for UI
+        if object_type == 'schemas':
+            objects = [
+                {
+                    'name': obj['full_name'].split('.')[-1],  # Extract schema name from "catalog.schema"
+                    'full_name': obj['full_name'],
+                    'description': obj['description'],
+                    'table_count': obj.get('table_count', 0)
+                }
+                for obj in described_objects['schemas']
+            ]
+        elif object_type == 'tables':
+            objects = [
+                {
+                    'name': obj['full_name'].split('.')[-1],  # Extract table name from "catalog.schema.table"
+                    'full_name': obj['full_name'],
+                    'schema': obj['schema'],
+                    'description': obj['description'],
+                    'column_count': obj.get('column_count', 0)
+                }
+                for obj in described_objects['tables']
+            ]
+        elif object_type == 'columns':
+            objects = [
+                {
+                    'name': obj['full_name'].split('.')[-1],  # Extract column name from "catalog.schema.table.column"
+                    'full_name': obj['full_name'],
+                    'table': obj.get('table', ''),
+                    'data_type': obj.get('data_type', 'unknown'),
+                    'description': obj['description']
+                }
+                for obj in described_objects['columns']
+            ]
+        else:
+            return jsonify({"error": f"Invalid object type: {object_type}"}), 400
+        
+        logger.info(f"Found {len(objects)} described {object_type} in {catalog_name}")
+        
+        return jsonify({
+            "success": True,
+            "catalog": catalog_name,
+            "object_type": object_type,
+            "objects": objects,
+            "count": len(objects)
+        })
+    except Exception as e:
+        logger.error(f"Error getting improvement options: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # Import generation functionality from main app
 from app import run_async_in_thread, get_enhanced_generator, get_setup_manager
 from datetime import datetime as dt
@@ -2660,6 +2723,384 @@ def api_import_apply():
         
     except Exception as e:
         logger.error(f"Error applying imported metadata: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------- Improve Metadata APIs -----------------------------------
+@flask_app.route('/api/metadata/assess-quality', methods=['POST'])
+def api_assess_quality():
+    """Scan and assess quality of existing descriptions"""
+    try:
+        from flask import request
+        from metadata_quality_scorer import MetadataQualityScorer
+        
+        data = request.get_json()
+        catalog = data.get('catalog')
+        selected_schemas = data.get('selected_schemas', None)
+        selected_tables = data.get('selected_tables', None)
+        selected_columns = data.get('selected_columns', None)
+        
+        if not catalog:
+            return jsonify({"error": "catalog is required"}), 400
+        
+        unity = get_unity_service()
+        scorer = MetadataQualityScorer()
+        
+        # Pass arrays as-is: None = no filter (include all), [] = user selected none (include none), [items] = include only those
+        result = scorer.assess_catalog_quality(
+            unity, 
+            catalog,
+            selected_schemas,
+            selected_tables,
+            selected_columns
+        )
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error assessing quality: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/generate-improvements', methods=['POST'])
+def api_generate_improvements():
+    """Generate improved descriptions for selected objects"""
+    try:
+        from flask import request
+        from enhanced_generator import EnhancedMetadataGenerator
+        import uuid
+        
+        data = request.get_json()
+        objects = data.get('objects', [])  # List of {full_name, object_type, current_description}
+        
+        if not objects:
+            return jsonify({"error": "objects is required"}), 400
+        
+        # Create a run ID for this improvement job
+        run_id = str(uuid.uuid4())
+        
+        # Use existing enhanced generator
+        unity = get_unity_service()
+        llm_service = get_llm_service()
+        settings_mgr = get_settings_manager_safe()
+        # Note: EnhancedMetadataGenerator expects (llm_service, unity_service, settings_manager)
+        enhanced_gen = EnhancedMetadataGenerator(llm_service, unity, settings_mgr)
+        
+        # Disable PII detection and data profiling for improvements (not needed when improving existing descriptions)
+        enhanced_gen.config['enable_pii_detection'] = False
+        enhanced_gen.config['enable_data_profiling'] = False
+        logger.info("🔧 Disabled PII detection and data profiling for improvement generation")
+        
+        # Process in background
+        async def generate_improvements_async():
+            try:
+                logger.info(f"🚀 Starting improvement generation for run {run_id}")
+                improvements = []
+                
+                # Group by type for batch processing
+                schemas = [o for o in objects if o['object_type'] == 'schema']
+                tables = [o for o in objects if o['object_type'] == 'table']
+                columns = [o for o in objects if o['object_type'] == 'column']
+                
+                logger.info(f"📋 Processing {len(schemas)} schemas, {len(tables)} tables, {len(columns)} columns")
+                
+                # Check for cancellation flag
+                def is_cancelled():
+                    if not hasattr(flask_app, 'improvement_cancellations'):
+                        return False
+                    return run_id in flask_app.improvement_cancellations
+                
+                # Get model from settings (settings_mgr already retrieved above)
+                if settings_mgr:
+                    models_config_data = settings_mgr.get_models_config()
+                    model = models_config_data.get('default_model', 'databricks-gpt-oss-20b')
+                else:
+                    model = 'databricks-gpt-oss-20b'
+                logger.info(f"Using model: {model}")
+                
+                # Generate for schemas
+                for schema_obj in schemas:
+                    if is_cancelled():
+                        logger.info(f"🛑 Generation cancelled for run {run_id}")
+                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        return
+                    
+                    logger.info(f"🔄 Generating for schema: {schema_obj['full_name']}")
+                    parts = schema_obj['full_name'].split('.')
+                    if len(parts) >= 2:
+                        catalog, schema_name = parts[0], parts[1]
+                        # Build schema_info dict with expected structure
+                        schema_info = {
+                            'name': schema_name,
+                            'full_name': schema_obj['full_name'],
+                            'catalog_name': catalog,
+                            'comment': schema_obj['current_description'],
+                            'owner': ''
+                        }
+                        result = await enhanced_gen._generate_schema_metadata_enhanced(
+                            schema_info, catalog, model, run_id
+                        )
+                        improvements.append({
+                            'full_name': schema_obj['full_name'],
+                            'object_type': 'schema',
+                            'current_description': schema_obj['current_description'],
+                            'new_description': result.get('proposed_comment', ''),
+                            'confidence': result.get('confidence_score', 0.0)
+                        })
+                
+                # Generate for tables (batch by catalog)
+                tables_by_catalog = {}
+                for table_obj in tables:
+                    parts = table_obj['full_name'].split('.')
+                    if len(parts) >= 3:
+                        catalog = parts[0]
+                        if catalog not in tables_by_catalog:
+                            tables_by_catalog[catalog] = []
+                        tables_by_catalog[catalog].append(table_obj)
+                
+                for catalog, catalog_tables in tables_by_catalog.items():
+                    if is_cancelled():
+                        logger.info(f"🛑 Generation cancelled for run {run_id}")
+                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        return
+                    
+                    logger.info(f"🔄 Generating for {len(catalog_tables)} tables in catalog {catalog}")
+                    
+                    # Build table dicts with expected structure
+                    table_dicts = []
+                    for table_obj in catalog_tables:
+                        parts = table_obj['full_name'].split('.')
+                        catalog_name, schema_name, table_name = parts[0], parts[1], parts[2]
+                        table_dicts.append({
+                            'name': table_name,
+                            'full_name': table_obj['full_name'],
+                            'catalog_name': catalog_name,
+                            'schema_name': schema_name,
+                            'table_name': table_name,
+                            'table_type': 'TABLE',
+                            'comment': table_obj['current_description'],
+                            'owner': ''
+                        })
+                    
+                    results = await enhanced_gen._generate_tables_batch(
+                        table_dicts, catalog, model, run_id
+                    )
+                    
+                    for i, table_obj in enumerate(catalog_tables):
+                        if i < len(results):
+                            improvements.append({
+                                'full_name': table_obj['full_name'],
+                                'object_type': 'table',
+                                'current_description': table_obj['current_description'],
+                                'new_description': results[i].get('proposed_comment', ''),
+                                'confidence': results[i].get('confidence_score', 0.0)
+                            })
+                
+                # Generate for columns (batch by table)
+                columns_by_table = {}
+                for col_obj in columns:
+                    parts = col_obj['full_name'].split('.')
+                    if len(parts) >= 4:
+                        table_key = '.'.join(parts[:3])  # catalog.schema.table
+                        if table_key not in columns_by_table:
+                            columns_by_table[table_key] = []
+                        columns_by_table[table_key].append(col_obj)
+                
+                for table_key, table_columns in columns_by_table.items():
+                    if is_cancelled():
+                        logger.info(f"🛑 Generation cancelled for run {run_id}")
+                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        return
+                    
+                    parts = table_key.split('.')
+                    catalog, schema, table = parts[0], parts[1], parts[2]
+                    logger.info(f"🔄 Generating for {len(table_columns)} columns in table {table_key}")
+                    
+                    # Build column dicts with expected structure
+                    column_dicts = []
+                    for col_obj in table_columns:
+                        column_name = col_obj['full_name'].split('.')[3]
+                        column_dicts.append({
+                            'name': column_name,
+                            'full_name': col_obj['full_name'],
+                            'catalog_name': catalog,
+                            'schema_name': schema,
+                            'table_name': table,
+                            'column_name': column_name,
+                            'data_type': '',
+                            'is_nullable': '',
+                            'column_default': '',
+                            'comment': col_obj['current_description']
+                        })
+                    
+                    result = await enhanced_gen._generate_column_chunk_metadata(
+                        column_dicts, model, run_id
+                    )
+                    
+                    # _generate_column_chunk_metadata returns a dict with 'metadata' key containing list of results
+                    metadata_list = result.get('metadata', [])
+                    for i, col_obj in enumerate(table_columns):
+                        if i < len(metadata_list):
+                            improvements.append({
+                                'full_name': col_obj['full_name'],
+                                'object_type': 'column',
+                                'current_description': col_obj['current_description'],
+                                'new_description': metadata_list[i].get('proposed_comment', ''),
+                                'confidence': metadata_list[i].get('confidence_score', 0.0)
+                            })
+                
+                # Store results
+                if not hasattr(flask_app, 'improvement_status'):
+                    flask_app.improvement_status = {}
+                flask_app.improvement_status[run_id] = {
+                    'status': 'completed',
+                    'improvements': improvements,
+                    'total': len(improvements),
+                    'completed_at': None
+                }
+                
+                logger.info(f"✅ Generated {len(improvements)} improved descriptions for run {run_id}")
+                
+            except Exception as e:
+                import traceback
+                logger.error(f"❌ Error generating improvements: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                if not hasattr(flask_app, 'improvement_status'):
+                    flask_app.improvement_status = {}
+                flask_app.improvement_status[run_id] = {
+                    'status': 'failed',
+                    'error': str(e)
+                }
+        
+        # Store initial status
+        if not hasattr(flask_app, 'improvement_status'):
+            flask_app.improvement_status = {}
+        flask_app.improvement_status[run_id] = {
+            'status': 'running',
+            'total': len(objects),
+            'processed': 0
+        }
+        
+        # Start async generation using run_async_in_thread (enhanced_gen methods are async)
+        try:
+            logger.info(f"🎬 Starting async thread for run {run_id}")
+            run_async_in_thread(generate_improvements_async())
+            logger.info(f"✅ Async thread started for run {run_id}")
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ Failed to start async thread: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            flask_app.improvement_status[run_id] = {
+                'status': 'failed',
+                'error': f'Failed to start async task: {str(e)}'
+            }
+        
+        return jsonify({
+            "success": True,
+            "run_id": run_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting improvement generation: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/improvement-status/<run_id>', methods=['GET'])
+def api_improvement_status(run_id):
+    """Get status of improvement generation"""
+    try:
+        if not hasattr(flask_app, 'improvement_status'):
+            return jsonify({"error": "No improvement tasks found"}), 404
+        
+        if run_id not in flask_app.improvement_status:
+            return jsonify({"error": "Run ID not found"}), 404
+        
+        return jsonify({
+            "success": True,
+            "data": flask_app.improvement_status[run_id]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting improvement status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/cancel-improvements/<run_id>', methods=['POST'])
+def api_cancel_improvements(run_id):
+    """Cancel a running improvement generation task"""
+    try:
+        if not hasattr(flask_app, 'improvement_status'):
+            return jsonify({"error": "No improvement tasks found"}), 404
+        
+        if run_id not in flask_app.improvement_status:
+            return jsonify({"error": "Run ID not found"}), 404
+        
+        status = flask_app.improvement_status[run_id].get('status')
+        
+        # Check if already completed or cancelled
+        if status in ['completed', 'cancelled', 'failed']:
+            return jsonify({
+                "success": False,
+                "message": f"Generation already {status}",
+                "run_id": run_id
+            }), 400
+        
+        # Set cancellation flag
+        if not hasattr(flask_app, 'improvement_cancellations'):
+            flask_app.improvement_cancellations = set()
+        
+        flask_app.improvement_cancellations.add(run_id)
+        
+        logger.info(f"🛑 Cancellation requested for improvement run: {run_id}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Cancellation requested",
+            "run_id": run_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error cancelling improvement: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/commit-improvements', methods=['POST'])
+def api_commit_improvements():
+    """Commit improved descriptions to Unity Catalog"""
+    try:
+        from flask import request
+        
+        data = request.get_json()
+        improvements = data.get('improvements', [])  # List of {full_name, new_description, object_type}
+        
+        if not improvements:
+            return jsonify({"error": "improvements is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        # Use existing bulk copy logic
+        mappings = [
+            {
+                'target_full_name': imp['full_name'],
+                'description': imp['new_description'],
+                'object_type': imp['object_type']
+            }
+            for imp in improvements
+        ]
+        
+        result = copy_utils.copy_metadata_bulk(mappings)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error committing improvements: {e}")
         return jsonify({"error": str(e)}), 500
 
 
