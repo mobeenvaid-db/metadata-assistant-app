@@ -263,27 +263,33 @@ class MetadataCopyUtils:
             raise
     
     def smart_match_objects(self, source_objects: List[Dict], target_catalog: str, 
-                           target_schema: Optional[str] = None) -> Dict:
+                           target_schema: Optional[str] = None, progress_callback=None, 
+                           cancellation_check=None) -> Dict:
         """
-        Generate smart matches between source and target objects
+        Generate smart matches between source and target objects (OPTIMIZED)
         
         Args:
             source_objects: List of {full_name, description, object_type}
             target_catalog: Target catalog name
             target_schema: Optional target schema filter
+            progress_callback: Optional callback function(current, total, object_name)
+            cancellation_check: Optional function that returns True if cancelled
         
         Returns:
             {
                 'matches': [{source, target, confidence, match_type, description}, ...],
                 'unmatched_sources': [...],
-                'unmatched_targets': [...]
+                'unmatched_targets': [...],
+                'cancelled': bool (True if cancelled)
             }
         """
         matches = []
         unmatched_sources = []
+        cancelled = False
         
         try:
-            # Get target objects WITHOUT descriptions (undescribed targets only)
+            # OPTIMIZATION 1: Get target objects WITHOUT descriptions (undescribed targets only)
+            logger.info(f"🔍 Fetching target objects from {target_catalog}")
             target_data = self.get_objects_without_descriptions(target_catalog, target_schema)
             target_objects = []
             for schema in target_data['schemas']:
@@ -293,10 +299,55 @@ class MetadataCopyUtils:
             for column in target_data['columns']:
                 target_objects.append({'full_name': column['full_name'], 'object_type': 'column'})
             
+            logger.info(f"📦 Found {len(target_objects)} target objects ({len(target_data['schemas'])} schemas, {len(target_data['tables'])} tables, {len(target_data['columns'])} columns)")
+            
+            # OPTIMIZATION 2: Build lookup indexes for faster matching
+            targets_by_type = {
+                'schema': [t for t in target_objects if t['object_type'] == 'schema'],
+                'table': [t for t in target_objects if t['object_type'] == 'table'],
+                'column': [t for t in target_objects if t['object_type'] == 'column']
+            }
+            
+            # OPTIMIZATION 3: Pre-parse target names for faster comparison
+            targets_with_parts = {}
+            for target in target_objects:
+                targets_with_parts[target['full_name']] = {
+                    'parts': target['full_name'].split('.'),
+                    'object_type': target['object_type']
+                }
+            
+            # OPTIMIZATION 4: PRE-FETCH ALL TABLE COLUMNS IN BULK (MAJOR SPEEDUP)
+            import time
+            start_time = time.time()
+            logger.info(f"🚀 Pre-fetching column metadata for all tables...")
+            table_columns_cache = {}
+            
+            # Get all source table names
+            source_table_names = [s['full_name'] for s in source_objects if s['object_type'] == 'table']
+            # Get all target table names
+            target_table_names = [t['full_name'] for t in targets_by_type['table']]
+            all_table_names = source_table_names + target_table_names
+            
+            if all_table_names:
+                # Build bulk query to fetch all columns at once
+                table_columns_cache = self._bulk_fetch_table_columns(all_table_names)
+                fetch_time = time.time() - start_time
+                logger.info(f"✅ Pre-fetched columns for {len(table_columns_cache)}/{len(all_table_names)} tables in {fetch_time:.2f}s")
+            
             # Track which targets have been matched
             matched_targets = set()
             
-            for source in source_objects:
+            total_sources = len(source_objects)
+            for idx, source in enumerate(source_objects):
+                # Check for cancellation
+                if cancellation_check and cancellation_check():
+                    logger.info(f"🛑 Smart match cancelled after processing {idx}/{total_sources} objects")
+                    cancelled = True
+                    break
+                
+                # Progress callback (update every 5 objects or at boundaries for smoother UX)
+                if progress_callback and (idx % 5 == 0 or idx == total_sources - 1):
+                    progress_callback(idx + 1, total_sources, source['full_name'])
                 source_name = source['full_name']
                 source_type = source['object_type']
                 description = source['description']
@@ -304,10 +355,10 @@ class MetadataCopyUtils:
                 # Parse source name
                 source_parts = source_name.split('.')
                 
-                # Get eligible targets of same type
+                # OPTIMIZATION 4: Use indexed lookup instead of filtering all targets
                 eligible_targets = [
-                    t for t in target_objects 
-                    if t['object_type'] == source_type and t['full_name'] not in matched_targets
+                    t for t in targets_by_type.get(source_type, [])
+                    if t['full_name'] not in matched_targets
                 ]
                 
                 # Try matching strategies in order of confidence
@@ -319,9 +370,9 @@ class MetadataCopyUtils:
                     match['match_type'] = 'exact'
                     match['confidence'] = 1.0
                 
-                # Strategy 2: Table structure match (all columns match)
+                # Strategy 2: Table structure match (all columns match) - USE CACHE
                 if not match and source_type == 'table':
-                    match = self._table_structure_match(source_name, eligible_targets)
+                    match = self._table_structure_match_cached(source_name, eligible_targets, table_columns_cache)
                     if match:
                         match['match_type'] = 'structure'
                         # confidence set by structure matcher based on column overlap
@@ -366,14 +417,17 @@ class MetadataCopyUtils:
                 if t['full_name'] not in matched_targets
             ]
             
-            logger.info(f"Smart match results: {len(matches)} matches, "
+            total_time = time.time() - start_time
+            status_msg = "cancelled" if cancelled else "completed"
+            logger.info(f"{'🛑' if cancelled else '✅'} Smart match {status_msg} in {total_time:.2f}s: {len(matches)} matches, "
                        f"{len(unmatched_sources)} unmatched sources, "
                        f"{len(unmatched_targets)} unmatched targets")
             
             return {
                 'matches': matches,
                 'unmatched_sources': unmatched_sources,
-                'unmatched_targets': unmatched_targets
+                'unmatched_targets': unmatched_targets,
+                'cancelled': cancelled
             }
             
         except Exception as e:
@@ -533,6 +587,126 @@ class MetadataCopyUtils:
         except Exception as e:
             logger.error(f"Error fetching columns for {table_full_name}: {e}")
             return []
+    
+    def _bulk_fetch_table_columns(self, table_names: List[str]) -> Dict[str, List[str]]:
+        """
+        Fetch columns for multiple tables in one or few queries (MAJOR OPTIMIZATION)
+        
+        Returns: Dict mapping table_full_name -> list of column names
+        """
+        columns_cache = {}
+        if not table_names:
+            return columns_cache
+        
+        try:
+            # Group tables by catalog for efficient querying
+            tables_by_catalog = {}
+            for table_name in table_names:
+                parts = table_name.split('.')
+                if len(parts) < 3:
+                    continue
+                catalog = parts[0]
+                if catalog not in tables_by_catalog:
+                    tables_by_catalog[catalog] = []
+                tables_by_catalog[catalog].append({
+                    'full_name': table_name,
+                    'catalog': parts[0],
+                    'schema': parts[1],
+                    'table': parts[2]
+                })
+            
+            # Query each catalog once
+            for catalog, tables in tables_by_catalog.items():
+                # Build WHERE clause for all tables in this catalog
+                table_conditions = []
+                for t in tables:
+                    table_conditions.append(f"(table_schema = '{t['schema']}' AND table_name = '{t['table']}')")
+                
+                if not table_conditions:
+                    continue
+                
+                where_clause = " OR ".join(table_conditions)
+                
+                bulk_sql = f"""
+                    SELECT 
+                        CONCAT(table_catalog, '.', table_schema, '.', table_name) as full_name,
+                        column_name
+                    FROM {catalog}.information_schema.columns
+                    WHERE table_catalog = '{catalog}'
+                        AND ({where_clause})
+                    ORDER BY table_schema, table_name, ordinal_position
+                """
+                
+                results = self.unity_service._execute_sql_warehouse(bulk_sql)
+                
+                # Group results by table
+                for row in results:
+                    full_name = row[0]
+                    column_name = row[1]
+                    if full_name not in columns_cache:
+                        columns_cache[full_name] = []
+                    columns_cache[full_name].append(column_name)
+            
+            return columns_cache
+            
+        except Exception as e:
+            logger.error(f"Error in bulk column fetch: {e}")
+            # Fallback: return empty cache, will use old method
+            return {}
+    
+    def _table_structure_match_cached(self, source_table_name: str, target_tables: List[Dict], 
+                                      columns_cache: Dict[str, List[str]]) -> Optional[Dict]:
+        """Match tables by comparing column structures using pre-fetched cache"""
+        try:
+            # Get columns for source table from cache
+            source_columns = columns_cache.get(source_table_name, [])
+            if not source_columns:
+                # Fallback to direct query if not in cache
+                source_columns = self._get_table_columns(source_table_name)
+            
+            if not source_columns:
+                return None
+            
+            source_column_names = set(col.lower() for col in source_columns)
+            
+            best_match = None
+            best_overlap = 0.0
+            
+            for target in target_tables:
+                target_table_name = target['full_name']
+                
+                # Get columns from cache
+                target_columns = columns_cache.get(target_table_name, [])
+                if not target_columns:
+                    # Fallback to direct query if not in cache
+                    target_columns = self._get_table_columns(target_table_name)
+                
+                if not target_columns:
+                    continue
+                
+                target_column_names = set(col.lower() for col in target_columns)
+                
+                # Calculate column overlap
+                if len(source_column_names) > 0:
+                    intersection = source_column_names & target_column_names
+                    union = source_column_names | target_column_names
+                    overlap_ratio = len(intersection) / len(union)  # Jaccard similarity
+                    
+                    # Require high overlap (90%+ of columns match)
+                    if overlap_ratio >= 0.9 and overlap_ratio > best_overlap:
+                        best_overlap = overlap_ratio
+                        # Confidence: 0.95 for 100% match, scales down to 0.85 for 90% match
+                        confidence = 0.85 + (overlap_ratio - 0.9) * 1.0
+                        best_match = {
+                            'target': target_table_name,
+                            'confidence': min(confidence, 0.95)
+                        }
+            
+            return best_match
+            
+        except Exception as e:
+            logger.error(f"Error in cached table structure matching: {e}")
+            return None
     
     def _pattern_based_match(self, source_parts: List[str], targets: List[Dict], object_type: str) -> Optional[Dict]:
         """Match with bronze→silver, silver→gold patterns"""
@@ -809,6 +983,262 @@ class MetadataCopyUtils:
         finally:
             output.close()
     
+    def validate_tag(self, tag_key: str, tag_value: str, object_full_name: str) -> Dict:
+        """
+        Validate a tag key/value pair
+        
+        Args:
+            tag_key: The tag key to validate
+            tag_value: The proposed tag value
+            object_full_name: The full object name for context
+        
+        Returns:
+            {
+                'is_valid': bool,
+                'exists': bool,  # Tag key exists in UC
+                'is_governed': bool,  # Tag has allowed values
+                'allowed_values': List[str] or None,
+                'validation_message': str,
+                'needs_creation': bool  # Tag doesn't exist and will be created
+            }
+        """
+        try:
+            # Get list of existing tags (note: Unity Catalog doesn't expose tag schemas via SQL)
+            tags_sql = """
+                SELECT DISTINCT tag_name
+                FROM system.information_schema.catalog_tags
+                WHERE tag_name IS NOT NULL
+            """
+            existing_tags = self.unity_service._execute_sql_warehouse(tags_sql)
+            
+            # Build a simple set of existing tag names
+            existing_tag_names = {row[0].lower() for row in existing_tags}
+            tag_key_lower = tag_key.lower()
+            
+            if tag_key_lower not in existing_tag_names:
+                logger.info(f"Tag '{tag_key}' not found in catalog - will be created")
+                return {
+                    'is_valid': True,
+                    'exists': False,
+                    'is_governed': False,
+                    'allowed_values': None,
+                    'validation_message': f'Tag "{tag_key}" will be created',
+                    'needs_creation': True
+                }
+            
+            # Tag exists - we can't check governed values via SQL
+            logger.info(f"Tag '{tag_key}' exists - allowing value '{tag_value}' (governed validation not available)")
+            return {
+                'is_valid': True,
+                'exists': True,
+                'is_governed': False,  # Can't determine via SQL
+                'allowed_values': None,
+                'validation_message': 'Tag exists',
+                'needs_creation': False
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error validating tag {tag_key}: {e}")
+            # On error, assume tag is valid but will be created
+            return {
+                'is_valid': True,
+                'exists': False,
+                'is_governed': False,
+                'allowed_values': None,
+                'validation_message': f'Tag validation skipped (will be created): {str(e)}',
+                'needs_creation': True
+            }
+    
+    def _fetch_tag_definitions_once(self) -> Dict:
+        """
+        Fetch all tag definitions from Unity Catalog ONCE for efficient batch validation.
+        
+        Note: Unity Catalog doesn't expose tag schemas via SQL easily. We can only see
+        applied tags. For now, we'll just track which tags exist and skip governed validation.
+        
+        Returns:
+            Dict mapping tag_name (lowercase) to (actual_tag_name, tag_info)
+        """
+        try:
+            # Get list of unique tag names that exist in the catalog
+            # catalog_tags shows tag assignments, not schemas, but we can at least
+            # see which tags exist
+            tags_sql = """
+                SELECT DISTINCT tag_name
+                FROM system.information_schema.catalog_tags
+                WHERE tag_name IS NOT NULL
+            """
+            existing_tags = self.unity_service._execute_sql_warehouse(tags_sql)
+            logger.info(f"📋 Fetched {len(existing_tags)} unique tag names from catalog")
+            
+            # Build a map of tag keys (we only know they exist, not their schemas)
+            tag_map = {}
+            for row in existing_tags:
+                tag_name = row[0]
+                tag_map[tag_name] = {
+                    'exists': True,
+                    'is_governed': False,  # Can't determine from SQL
+                    'allowed_values': None
+                }
+            
+            logger.info(f"📋 Tag validation will allow all values (governed tag checking not available via SQL)")
+            
+            # Build case-insensitive lookup
+            tag_map_lower = {k.lower(): (k, v) for k, v in tag_map.items()}
+            return tag_map_lower
+            
+        except Exception as e:
+            logger.error(f"Error fetching tag definitions: {e}")
+            return {}
+    
+    def validate_tags_via_api(self, tags_to_validate: List[Dict]) -> Dict:
+        """
+        Validate tags using Unity Catalog governed tags API.
+        
+        Args:
+            tags_to_validate: List of {tag_key, tag_value, object_name} to validate
+        
+        Returns:
+            {
+                'results': [{tag_key, tag_value, object_name, is_valid, validation_message}],
+                'valid_count': int,
+                'invalid_count': int
+            }
+        """
+        results = []
+        valid_count = 0
+        invalid_count = 0
+        
+        # Get unique tag keys to query
+        unique_tags = {t['tag_key'] for t in tags_to_validate}
+        
+        logger.info(f"🔍 Validating {len(tags_to_validate)} tags using governed tags API...")
+        
+        try:
+            # Use existing unity_service.get_governed_tags() method
+            governed_tags = self.unity_service.get_governed_tags()
+            logger.info(f"✓ Fetched {len(governed_tags)} governed tag definitions")
+            
+            # Build tag schemas map from governed tags
+            tag_schemas = {}
+            for tag_key in unique_tags:
+                if tag_key in governed_tags:
+                    allowed_values = governed_tags[tag_key].get('allowed_values', [])
+                    tag_schemas[tag_key] = {
+                        'exists': True,
+                        'is_governed': len(allowed_values) > 0,
+                        'allowed_values': allowed_values
+                    }
+                    if allowed_values:
+                        logger.info(f"✓ Tag '{tag_key}' is governed with values: {allowed_values}")
+                else:
+                    # Tag not in governed tags - could be a regular tag or doesn't exist yet
+                    # We can't definitively say if it exists or not without querying catalog_tags
+                    tag_schemas[tag_key] = {
+                        'exists': None,  # Unknown - could exist as non-governed tag
+                        'is_governed': False,
+                        'allowed_values': []
+                    }
+                    logger.info(f"✓ Tag '{tag_key}' is not a governed tag")
+            
+            # Validate each tag
+            for tag_info in tags_to_validate:
+                tag_key = tag_info['tag_key']
+                tag_value = tag_info['tag_value']
+                object_name = tag_info.get('object_name', '')
+                
+                schema = tag_schemas.get(tag_key, {})
+                
+                if schema.get('is_governed'):
+                    # Governed tag - validate value against allowed_values
+                    allowed = schema['allowed_values']
+                    if tag_value in allowed:
+                        results.append({
+                            'tag_key': tag_key,
+                            'tag_value': tag_value,
+                            'object_name': object_name,
+                            'is_valid': True,
+                            'validation_message': f'✓ Valid governed tag value'
+                        })
+                        valid_count += 1
+                    else:
+                        results.append({
+                            'tag_key': tag_key,
+                            'tag_value': tag_value,
+                            'object_name': object_name,
+                            'is_valid': False,
+                            'validation_message': f'Invalid value "{tag_value}" for governed tag "{tag_key}". Allowed values: {", ".join(allowed)}'
+                        })
+                        invalid_count += 1
+                else:
+                    # Not a governed tag - allow any value
+                    results.append({
+                        'tag_key': tag_key,
+                        'tag_value': tag_value,
+                        'object_name': object_name,
+                        'is_valid': True,
+                        'validation_message': '✓ Valid tag (not governed)'
+                    })
+                    valid_count += 1
+            
+            logger.info(f"🔍 Tag validation complete: {valid_count} valid, {invalid_count} invalid")
+            
+            return {
+                'results': results,
+                'valid_count': valid_count,
+                'invalid_count': invalid_count
+            }
+        
+        except Exception as e:
+            logger.error(f"Error during tag validation: {e}")
+            return {
+                'results': [],
+                'valid_count': 0,
+                'invalid_count': 0,
+                'error': f'Tag validation failed: {str(e)}'
+            }
+    
+    def _validate_tag_fast(self, tag_key: str, tag_value: str, tag_map_lower: Dict) -> Dict:
+        """
+        Fast tag validation using pre-fetched tag names (simple dict lookup).
+        
+        Note: Unity Catalog doesn't expose tag schemas via SQL, so we can only check
+        if a tag exists, not validate against governed values. Tags that don't exist
+        will be created when applied.
+        
+        Args:
+            tag_key: The tag key to validate
+            tag_value: The proposed tag value
+            tag_map_lower: Pre-fetched tag names (lowercase keys)
+        
+        Returns: Same format as validate_tag()
+        """
+        tag_key_lower = tag_key.lower()
+        
+        # Check if tag exists (case-insensitive)
+        if tag_key_lower not in tag_map_lower:
+            return {
+                'is_valid': True,
+                'exists': False,
+                'is_governed': False,
+                'allowed_values': None,
+                'validation_message': f'Tag "{tag_key}" will be created',
+                'needs_creation': True
+            }
+        
+        # Get the actual tag name and info
+        actual_tag_name, tag_info = tag_map_lower[tag_key_lower]
+        
+        # Tag exists - allow any value (can't validate governed tags via SQL)
+        return {
+            'is_valid': True,
+            'exists': True,
+            'is_governed': False,
+            'allowed_values': None,
+            'validation_message': 'Tag exists',
+            'needs_creation': False
+        }
+    
     def import_metadata_csv(self, csv_content: str, target_catalog: str = None) -> Dict:
         """
         Parse and validate imported CSV
@@ -832,6 +1262,10 @@ class MetadataCopyUtils:
         error_count = 0
         errors = []
         
+        # Fetch tag definitions ONCE for efficient batch validation
+        logger.info("📋 Pre-fetching tag definitions for efficient validation...")
+        tag_map_lower = self._fetch_tag_definitions_once()
+        
         # Check if remapping is enabled
         remap_catalog = target_catalog and target_catalog.strip()
         
@@ -843,6 +1277,10 @@ class MetadataCopyUtils:
             required_fields = ['full_name', 'object_type', 'description']
             if not all(field in csv_reader.fieldnames for field in required_fields):
                 raise ValueError(f"CSV must have columns: {', '.join(required_fields)}")
+            
+            # Check for optional tag columns
+            has_tags = 'tag_key' in csv_reader.fieldnames and 'tag_value' in csv_reader.fieldnames
+            logger.info(f"CSV has tag columns: {has_tags}")
             
             # Get all target objects to validate existence
             # If remapping, get objects from target catalog only
@@ -861,6 +1299,11 @@ class MetadataCopyUtils:
                 full_name = row.get('full_name', '').strip()
                 object_type = row.get('object_type', '').strip().lower()
                 description = row.get('description', '').strip()
+                
+                # Parse tags if present
+                tag_key = row.get('tag_key', '').strip() if has_tags else ''
+                tag_value = row.get('tag_value', '').strip() if has_tags else ''
+                tag_validation = None
                 
                 # Validate row
                 validation_message = ''
@@ -883,8 +1326,8 @@ class MetadataCopyUtils:
                     is_valid = False
                     errors.append({'row': row_num, 'error': validation_message})
                     error_count += 1
-                elif not description:
-                    validation_message = 'Missing description'
+                elif not description and not tag_key and not tag_value:
+                    validation_message = 'Must provide either description or tags'
                     is_valid = False
                     errors.append({'row': row_num, 'error': validation_message})
                     error_count += 1
@@ -985,12 +1428,26 @@ class MetadataCopyUtils:
                                 errors.append({'row': row_num, 'full_name': full_name, 'error': validation_message})
                                 error_count += 1
                 
+                # Validate tags if present (using pre-fetched tag definitions for speed)
+                if has_tags and tag_key:
+                    tag_validation = self._validate_tag_fast(tag_key, tag_value, tag_map_lower)
+                    if not tag_validation['is_valid']:
+                        # Tag validation failed - mark row as invalid
+                        is_valid = False
+                        validation_message = f"{validation_message}; Tag error: {tag_validation['validation_message']}" if validation_message else f"Tag error: {tag_validation['validation_message']}"
+                        error_count += 1
+                        valid_count = valid_count - 1 if valid_count > 0 else 0  # Decrement if we counted this as valid
+                        errors.append({'row': row_num, 'full_name': full_name, 'error': tag_validation['validation_message']})
+                
                 preview.append({
                     'row': row_num,
                     'full_name': full_name,
                     'target_full_name': target_full_name,  # The actual name to use in target
                     'object_type': object_type,
                     'description': description,
+                    'tag_key': tag_key if has_tags else None,
+                    'tag_value': tag_value if has_tags else None,
+                    'tag_validation': tag_validation,
                     'exists_in_catalog': exists_in_catalog,
                     'validation_message': validation_message,
                     'is_valid': is_valid
@@ -998,8 +1455,12 @@ class MetadataCopyUtils:
             
             logger.info(f"📥 CSV import validation: {valid_count} valid, {error_count} errors")
             
+            # Merge multiple rows for the same object (when they have tags but same/empty descriptions)
+            merged_preview = self._merge_preview_items(preview)
+            logger.info(f"📥 Merged {len(preview)} rows into {len(merged_preview)} unique objects")
+            
             return {
-                'preview': preview,
+                'preview': merged_preview,
                 'valid_count': valid_count,
                 'error_count': error_count,
                 'errors': errors
@@ -1009,37 +1470,137 @@ class MetadataCopyUtils:
             logger.error(f"Error parsing CSV: {e}")
             raise
     
+    def _merge_preview_items(self, preview: List[Dict]) -> List[Dict]:
+        """
+        Merge multiple rows for the same object into one preview item with multiple tags.
+        
+        Rules:
+        - Group by target_full_name + object_type
+        - If descriptions differ, keep rows separate
+        - If descriptions are same/empty, merge tags into one item
+        """
+        from collections import defaultdict
+        
+        # Group items by object identity
+        grouped = defaultdict(list)
+        for item in preview:
+            key = (item['target_full_name'], item['object_type'])
+            grouped[key].append(item)
+        
+        merged = []
+        for key, items in grouped.items():
+            if len(items) == 1:
+                # Single item, no merging needed - convert single tag to list
+                item = items[0]
+                if item['tag_key'] or item['tag_value']:
+                    item['tags'] = [{'key': item['tag_key'], 'value': item['tag_value'], 'validation': item['tag_validation']}]
+                else:
+                    item['tags'] = []
+                # Keep original fields for backward compatibility
+                merged.append(item)
+            else:
+                # Multiple items for same object - check if we should merge
+                descriptions = [item['description'] for item in items]
+                unique_descriptions = set(d for d in descriptions if d)  # non-empty descriptions
+                
+                if len(unique_descriptions) <= 1:
+                    # All descriptions are same or empty - merge into one item
+                    base_item = items[0].copy()
+                    
+                    # Collect all tags
+                    tags = []
+                    for item in items:
+                        if item['tag_key'] or item['tag_value']:
+                            tags.append({
+                                'key': item['tag_key'], 
+                                'value': item['tag_value'],
+                                'validation': item['tag_validation']
+                            })
+                    
+                    base_item['tags'] = tags
+                    # Use first non-empty description if any
+                    base_item['description'] = next((d for d in descriptions if d), '')
+                    
+                    merged.append(base_item)
+                else:
+                    # Descriptions differ - keep separate (unusual case, but handle it)
+                    for item in items:
+                        if item['tag_key'] or item['tag_value']:
+                            item['tags'] = [{'key': item['tag_key'], 'value': item['tag_value'], 'validation': item['tag_validation']}]
+                        else:
+                            item['tags'] = []
+                        merged.append(item)
+        
+        return merged
+    
     def apply_imported_metadata(self, mappings: List[Dict], overwrite_existing: bool = False) -> Dict:
         """
         Apply imported metadata from CSV
         
         Args:
-            mappings: List of {target_full_name, description, object_type} (only valid ones)
+            mappings: List of {target_full_name, description, object_type, tags: [{key, value}]} (only valid ones)
             overwrite_existing: Whether to overwrite existing descriptions
         
         Returns:
-            {success_count, skipped_count, errors: [{target, error_message}]}
+            {success_count, tag_success_count, skipped_count, errors: [{target, error_message}]}
         """
         success_count = 0
+        tag_success_count = 0
         skipped_count = 0
         errors = []
         
-        # If not overwriting, filter out objects that already have descriptions
-        if not overwrite_existing:
-            # Get existing descriptions from target
-            filtered_mappings = []
-            for mapping in mappings:
-                # Quick check: assume if they're importing, they want to update
-                # Full check would require querying each object
-                filtered_mappings.append(mapping)
-            mappings = filtered_mappings
+        # Apply descriptions for objects that have them
+        mappings_with_descriptions = [m for m in mappings if m.get('description')]
+        if mappings_with_descriptions:
+            result = self.copy_metadata_bulk(mappings_with_descriptions)
+            success_count = result['success_count']
+            errors.extend(result['errors'])
         
-        # Use existing bulk copy function
-        result = self.copy_metadata_bulk(mappings)
+        # Apply tags for objects that have them
+        for mapping in mappings:
+            tags_list = mapping.get('tags', [])
+            
+            # Handle both old format (tag_key/tag_value) and new format (tags array)
+            if not tags_list and mapping.get('tag_key') and mapping.get('tag_value'):
+                tags_list = [{'key': mapping['tag_key'], 'value': mapping['tag_value']}]
+            
+            for tag in tags_list:
+                try:
+                    target_full_name = mapping['target_full_name']
+                    tag_key = tag['key']
+                    tag_value = tag['value']
+                    
+                    if not tag_key or not tag_value:
+                        continue
+                    
+                    # Apply the tag using ALTER statement
+                    parts = target_full_name.split('.')
+                    if len(parts) == 2:  # Schema
+                        sql = f"ALTER SCHEMA {target_full_name} SET TAGS ('{tag_key}' = '{tag_value}')"
+                    elif len(parts) == 3:  # Table
+                        sql = f"ALTER TABLE {target_full_name} SET TAGS ('{tag_key}' = '{tag_value}')"
+                    elif len(parts) == 4:  # Column
+                        table_name = '.'.join(parts[:3])
+                        column_name = parts[3]
+                        sql = f"ALTER TABLE {table_name} ALTER COLUMN {column_name} SET TAGS ('{tag_key}' = '{tag_value}')"
+                    else:
+                        raise ValueError(f"Invalid object name format: {target_full_name}")
+                    
+                    self.unity_service._execute_sql_warehouse(sql)
+                    tag_success_count += 1
+                    logger.info(f"✅ Applied tag {tag_key}={tag_value} to {target_full_name}")
+                    
+                except Exception as e:
+                    error_msg = f"Failed to apply tag {tag.get('key')}={tag.get('value')} to {target_full_name}: {str(e)}"
+                    logger.error(error_msg)
+                    errors.append({'target': target_full_name, 'error_message': error_msg})
+        
+        logger.info(f"📝 Applied {success_count} descriptions and {tag_success_count} tags")
         
         return {
-            'success_count': result['success_count'],
+            'success_count': success_count,
+            'tag_success_count': tag_success_count,
             'skipped_count': skipped_count,
-            'errors': result['errors']
+            'errors': errors
         }
 

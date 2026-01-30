@@ -5,6 +5,7 @@ This version serves the React frontend and proxies API calls to the existing bac
 
 import os
 import logging
+import asyncio
 from flask import Flask, send_from_directory, jsonify
 from flask_cors import CORS
 
@@ -592,6 +593,52 @@ def api_migrate_model_settings():
         logger.error(traceback.format_exc())
         return jsonify({"success": False, "message": str(e)}), 500
 
+@flask_app.route('/api/settings/models/serving-endpoints', methods=['GET'])
+def api_get_serving_endpoints():
+    """Fetch list of serving endpoints from Databricks"""
+    try:
+        from databricks.sdk import WorkspaceClient
+        
+        w = WorkspaceClient()
+        
+        # List all serving endpoints
+        endpoints = []
+        try:
+            for endpoint in w.serving_endpoints.list():
+                # Extract endpoint name and basic info
+                # Convert state to string representation
+                state_str = 'UNKNOWN'
+                if endpoint.state:
+                    if hasattr(endpoint.state, 'ready'):
+                        state_str = 'READY' if endpoint.state.ready else 'NOT_READY'
+                    elif hasattr(endpoint.state, 'config_update'):
+                        state_str = 'UPDATING'
+                    else:
+                        # Fallback: try to convert state to string
+                        state_str = str(endpoint.state).split('.')[-1] if endpoint.state else 'UNKNOWN'
+                
+                endpoint_info = {
+                    'name': endpoint.name,
+                    'state': state_str,
+                    'creation_timestamp': int(endpoint.creation_timestamp) if endpoint.creation_timestamp else None
+                }
+                endpoints.append(endpoint_info)
+            
+            logger.info(f"✅ Fetched {len(endpoints)} serving endpoints from Databricks")
+            return jsonify({"success": True, "endpoints": endpoints})
+            
+        except Exception as list_error:
+            logger.error(f"❌ Error listing serving endpoints: {list_error}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return jsonify({"success": False, "message": f"Failed to fetch endpoints: {str(list_error)}"}), 500
+    
+    except Exception as e:
+        logger.error(f"❌ Error fetching serving endpoints: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"success": False, "message": str(e)}), 500
+
 @flask_app.route('/api/settings/models/add', methods=['POST'])
 def api_add_custom_model():
     """Add a custom model (validates first, then adds)"""
@@ -637,9 +684,57 @@ def api_add_custom_model():
     except Exception as e:
         logger.error(f"❌ Error adding custom model: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
+
+@flask_app.route('/api/settings/models/remove', methods=['POST'])
+def api_remove_custom_model():
+    """Remove a custom model"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        model_id = data.get('model_id', '').strip()
+        
+        if not model_id:
+            return jsonify({"success": False, "message": "Model ID is required"}), 400
+        
+        # Get models config manager
+        models_config = get_models_config_manager()
+        
+        # Check if it's a builtin model
+        all_models = models_config.get_available_models()
+        if model_id in all_models and all_models[model_id].get('builtin', False):
+            return jsonify({"success": False, "message": "Cannot remove built-in models. You can disable them instead."}), 400
+        
+        # Remove the custom model
+        settings_manager = get_settings_manager_safe()
+        if settings_manager:
+            settings = settings_manager.get_settings()
+            models_config_data = settings.get('models', {})
+            custom_models = models_config_data.get('custom_models', [])
+            enabled_models = models_config_data.get('enabled_models', [])
+            
+            # Filter out the model to remove
+            custom_models = [m for m in custom_models if m.get('model_id') != model_id]
+            enabled_models = [m for m in enabled_models if m != model_id]
+            
+            # Update settings
+            models_config_data['custom_models'] = custom_models
+            models_config_data['enabled_models'] = enabled_models
+            settings['models'] = models_config_data
+            
+            # save_settings returns None on success, raises exception on failure
+            settings_manager.save_settings(settings)
+            
+            logger.info(f"✅ Removed custom model: {model_id}")
+            return jsonify({"success": True, "message": "Model removed successfully"})
+        else:
+            return jsonify({"success": False, "message": "Settings manager not available"}), 500
+    
     except Exception as e:
-        logger.error(f"Failed to toggle model: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        logger.error(f"❌ Error removing custom model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"success": False, "message": str(e)}), 500
 
 @flask_app.route('/api/settings/pii')
 def api_get_pii_settings():
@@ -1461,13 +1556,14 @@ def update_generation_progress(run_id: str, **kwargs):
 
 @flask_app.route("/api/enhanced/run", methods=["POST"])
 def api_enhanced_run():
-    """Start enhanced metadata generation"""
+    """Start enhanced metadata generation (supports multiple models for comparison)"""
     try:
         from flask import request
         body = request.get_json() or {}
         catalog = body.get("catalog")
-        model = body.get("model", "databricks-gpt-oss-20b")
-        pii_model = body.get("piiModel", model)  # Default to metadata model if not specified
+        model = body.get("model")  # Can be single model string
+        models = body.get("models")  # Or array of models for comparison
+        pii_model = body.get("piiModel")  # Default to first metadata model if not specified
         # Note: 'style' parameter removed - generation style now controlled via Prompts settings
         selected_objects = body.get("selected_objects", {})
         
@@ -1480,7 +1576,21 @@ def api_enhanced_run():
                 "success": False
             }), 400
         
-        logger.info(f"Starting enhanced generation for catalog {catalog} (metadata model: {model}, PII model: {pii_model})")
+        # Handle both single and multi-model requests
+        if models and isinstance(models, list) and len(models) > 0:
+            # Multi-model comparison mode
+            model_list = models
+            is_comparison = True
+            if not pii_model:
+                pii_model = models[0]  # Use first model for PII if not specified
+            logger.info(f"Starting MULTI-MODEL comparison for catalog {catalog} with models: {', '.join(model_list)} (PII model: {pii_model})")
+        else:
+            # Single model mode (backward compatible)
+            model_list = [model or "databricks-gpt-oss-20b"]
+            is_comparison = False
+            if not pii_model:
+                pii_model = model_list[0]
+            logger.info(f"Starting enhanced generation for catalog {catalog} (metadata model: {model_list[0]}, PII model: {pii_model})")
         
         # Ensure setup is complete
         setup_manager = get_setup_manager()
@@ -1493,6 +1603,12 @@ def api_enhanced_run():
         # Start enhanced generation
         enhanced_generator = get_enhanced_generator()
         
+        # Get services for parallel model generators (from main app module)
+        from app import get_llm_service, get_unity_service, get_settings_manager_safe
+        llm_service = get_llm_service()
+        unity_service = get_unity_service()
+        settings_manager = get_settings_manager_safe()
+        
         # Generate run ID
         run_id = f"enhanced_{dt.now().strftime('%Y%m%d_%H%M%S')}_{catalog}"
         
@@ -1502,12 +1618,143 @@ def api_enhanced_run():
         
         enhanced_generator.set_progress_callback(progress_callback)
         
-        # Start generation in background with PII model (style parameter removed)
-        try:
-            logger.info(f"🚀 About to call generate_enhanced_metadata with: catalog={catalog}, model={model}, run_id={run_id}, pii_model={pii_model}, selected_objects count={selected_objects.get('totalCount', 0)}")
-            generation_future = run_async_in_thread(
-                enhanced_generator.generate_enhanced_metadata(catalog, model, selected_objects, run_id, pii_model)
+        # Set up incremental save callback (RESUME ON FAILURE support)
+        # This is the ONLY save mechanism - no final save to prevent duplicates
+        async def incremental_save_callback(results_batch, run_id):
+            """Save results incrementally so users never lose work on timeout"""
+            try:
+                if results_batch:
+                    logger.info(f"💾 Checkpoint: Saving {len(results_batch)} results incrementally...")
+                    save_status = await setup_manager.save_generation_results(results_batch)
+                    saved_count = save_status.get('saved_count', 0)
+                    logger.info(f"✅ Checkpoint saved: {saved_count} results")
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
+                # Don't fail generation on checkpoint failure
+        
+        # Enable incremental saves for single-model (resume-on-failure)
+        # Multi-model creates separate generators, so they don't use this callback
+        if not is_comparison:
+            enhanced_generator.set_incremental_save_callback(incremental_save_callback)
+            logger.info("📝 Incremental saves enabled for single-model (resume-on-failure support)")
+        else:
+            # Multi-model mode doesn't need this callback (each model is a separate generator)
+            logger.info("📝 Multi-model mode: Each model handles its own saves")
+        
+        # Multi-model generation function
+        async def generate_multi_model():
+            """Generate metadata with multiple models in PARALLEL for 3x speed boost"""
+            total_models = len(model_list)
+            
+            logger.info(f"🚀 Starting PARALLEL generation with {total_models} models: {', '.join(model_list)}")
+            
+            # Update progress to show parallel execution starting
+            update_generation_progress(
+                run_id,
+                status="generating_parallel",
+                current_phase=f"Generating with {total_models} models in parallel"
             )
+            
+            # Track aggregate progress across all models
+            completed_models = {'count': 0}  # Mutable dict for closure
+            base_objects_count = selected_objects.get("totalCount", 0)
+            
+            # Create async tasks for each model (PARALLEL execution)
+            async def generate_single_model(model_name, model_idx):
+                """Generate metadata for a single model"""
+                try:
+                    logger.info(f"🎯 Model {model_idx}/{total_models} ({model_name}) starting...")
+                    
+                    # Create model-specific enhanced_generator to avoid progress conflicts
+                    from enhanced_generator import EnhancedMetadataGenerator
+                    model_generator = EnhancedMetadataGenerator(llm_service, unity_service, settings_manager)
+                    model_generator.pii_detector = enhanced_generator.pii_detector
+                    
+                    # Share caches across models for efficiency
+                    model_generator.pii_cache = enhanced_generator.pii_cache
+                    model_generator.column_metadata_cache = enhanced_generator.column_metadata_cache
+                    model_generator.sample_data_cache = enhanced_generator.sample_data_cache
+                    model_generator.schema_tables_cache = enhanced_generator.schema_tables_cache
+                    
+                    # Set up progress callback for THIS model
+                    def model_progress_callback(**kwargs):
+                        # Aggregate progress: (completed_models × base_objects) + current_model_progress
+                        if 'processed_objects' in kwargs:
+                            # Calculate aggregate progress across all models
+                            aggregate_progress = (completed_models['count'] * base_objects_count) + kwargs['processed_objects']
+                            total_expected = total_models * base_objects_count
+                            
+                            # Update with aggregate numbers
+                            update_generation_progress(
+                                run_id,
+                                processed_objects=aggregate_progress,
+                                total_objects=total_expected,
+                                current_phase=kwargs.get('current_phase', f'Model {model_idx}/{total_models}'),
+                                current_object=kwargs.get('current_object', f'{model_name} processing...')
+                            )
+                    
+                    model_generator.set_progress_callback(model_progress_callback)
+                    # NOTE: Incremental saves disabled in parallel mode to prevent duplicates
+                    # Final save happens once at the end after all models complete
+                    
+                    result = await model_generator.generate_enhanced_metadata(
+                        catalog, model_name, selected_objects, run_id, pii_model, progress_offset=0
+                    )
+                    
+                    # Mark this model as complete for progress tracking
+                    completed_models['count'] += 1
+                    
+                    if result and result.get('generated_metadata'):
+                        logger.info(f"✅ Model {model_name} completed: {len(result['generated_metadata'])} items")
+                        return result['generated_metadata']
+                    
+                    return []
+                    
+                except Exception as model_error:
+                    logger.error(f"❌ Model {model_name} failed: {model_error}")
+                    update_generation_progress(
+                        run_id,
+                        errors=[f"Model {model_name} failed: {str(model_error)}"]
+                    )
+                    return []
+            
+            # Execute all models in PARALLEL using asyncio.gather()
+            try:
+                results_lists = await asyncio.gather(*[
+                    generate_single_model(model, idx) 
+                    for idx, model in enumerate(model_list, 1)
+                ])
+                
+                # Flatten results from all models
+                all_results = []
+                for results in results_lists:
+                    all_results.extend(results)
+                
+                logger.info(f"🎉 PARALLEL generation complete: {len(all_results)} total items from {total_models} models")
+                
+                return {
+                    'generated_metadata': all_results,
+                    'summary': {
+                        'total_items': len(all_results),
+                        'models_used': model_list,
+                        'comparison_mode': is_comparison
+                    }
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ Parallel generation failed: {e}")
+                raise
+        
+        # Start generation in background
+        try:
+            if is_comparison:
+                logger.info(f"🚀 Starting MULTI-MODEL generation for {run_id} with models: {', '.join(model_list)}")
+                generation_future = run_async_in_thread(generate_multi_model())
+            else:
+                logger.info(f"🚀 Starting single-model generation for {run_id} with model: {model_list[0]}")
+                generation_future = run_async_in_thread(
+                    enhanced_generator.generate_enhanced_metadata(catalog, model_list[0], selected_objects, run_id, pii_model)
+                )
             logger.info(f"✅ Background thread started successfully for {run_id}")
         except Exception as thread_error:
             logger.error(f"❌ Failed to start background thread: {thread_error}")
@@ -1528,6 +1775,9 @@ def api_enhanced_run():
         
         # Initialize progress tracking
         total_objects = selected_objects.get("totalCount", 0)
+        if is_comparison:
+            total_objects = total_objects * len(model_list)  # Multiply by number of models
+        
         flask_app.generation_progress[run_id] = {
             "status": "initializing",
             "progress": 0,
@@ -1538,16 +1788,20 @@ def api_enhanced_run():
             "phases": ["Setup", "Schema Analysis", "Table Analysis", "Column Analysis", "Finalization"],
             "phase_progress": 0,
             "start_time": dt.now().isoformat(),
-            "errors": []
+            "errors": [],
+            "comparison_mode": is_comparison,
+            "models": model_list if is_comparison else [model_list[0]]
         }
         
         return jsonify({
             "success": True,
             "run_id": run_id,
             "catalog": catalog,
-            "model": model,
+            "models": model_list if is_comparison else None,
+            "model": model_list[0] if not is_comparison else None,
             "pii_model": pii_model,
-            "status": "Enhanced generation started",
+            "comparison_mode": is_comparison,
+            "status": "Multi-model comparison generation started" if is_comparison else "Enhanced generation started",
             "timestamp": dt.now().isoformat()
         })
         
@@ -1593,7 +1847,7 @@ def api_enhanced_status(run_id):
                             save_future = run_async_in_thread(
                                 setup_manager.save_generation_results(result.get('generated_metadata', []))
                             )
-                            save_status = save_future.result(timeout=30)
+                            save_status = save_future.result(timeout=180)  # Increased timeout for large batches
                             logger.info(f"💾 Saved {save_status.get('saved_count', 0)} results from cancelled generation")
                         except Exception as e:
                             logger.error(f"Failed to save cancelled generation results: {e}")
@@ -1613,13 +1867,25 @@ def api_enhanced_status(run_id):
                         flask_app.completed_runs = {}
                     
                     if run_id not in flask_app.completed_runs:
-                        # Save results ONCE
-                        logger.info(f"💾 Saving results for {run_id} (first time)")
-                        setup_manager = get_setup_manager()
-                        save_future = run_async_in_thread(
-                            setup_manager.save_generation_results(result.get('generated_metadata', []))
-                        )
-                        save_status = save_future.result(timeout=30)
+                        # Check if results were already saved incrementally
+                        # For single-model: incremental saves handle everything
+                        # For multi-model: we need to save consolidated results here
+                        generated_metadata = result.get('generated_metadata', [])
+                        is_comparison_mode = progress_info.get('comparison_mode', False)
+                        
+                        if is_comparison_mode and generated_metadata:
+                            # Multi-model: Save all consolidated results from parallel models
+                            logger.info(f"💾 Saving consolidated multi-model results for {run_id}")
+                            setup_manager = get_setup_manager()
+                            save_future = run_async_in_thread(
+                                setup_manager.save_generation_results(generated_metadata)
+                            )
+                            save_status = save_future.result(timeout=180)
+                            saved_count = save_status['saved_count']
+                        else:
+                            # Single-model: Results already saved incrementally, just return count
+                            logger.info(f"✅ Single-model results already saved incrementally (skipping duplicate save)")
+                            saved_count = len(generated_metadata)
                         
                         # Cache the completed status to prevent re-saving
                         flask_app.completed_runs[run_id] = {
@@ -1628,7 +1894,7 @@ def api_enhanced_status(run_id):
                             "status": "COMPLETED",
                             "summary": result.get('summary', {}),
                             "duration_seconds": result.get('duration_seconds', 0),
-                            "results_saved": save_status['saved_count'],
+                            "results_saved": saved_count,
                             "timestamp": dt.now().isoformat()
                         }
                     else:
@@ -1721,7 +1987,141 @@ def api_enhanced_cancel(run_id):
         logger.error(f"Error cancelling generation: {e}")
         return jsonify({"error": str(e)}), 500
 
+@flask_app.route("/api/improvements/cancel/<run_id>", methods=['POST'])
+def api_improvements_cancel(run_id):
+    """Cancel a running improvement generation task"""
+    try:
+        # Set cancellation flag
+        if not hasattr(flask_app, 'improvement_cancellations'):
+            flask_app.improvement_cancellations = set()
+        
+        flask_app.improvement_cancellations.add(run_id)
+        
+        logger.info(f"🛑 Cancellation requested for improvement run: {run_id}")
+        
+        # Update status to show cancellation in progress
+        if hasattr(flask_app, 'improvement_status') and run_id in flask_app.improvement_status:
+            if flask_app.improvement_status[run_id].get('status') == 'running':
+                flask_app.improvement_status[run_id]['status'] = 'cancelling'
+        
+        return jsonify({
+            "success": True,
+            "message": "Cancellation requested. Will return results processed so far.",
+            "run_id": run_id,
+            "timestamp": dt.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Error cancelling improvements: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # --------------------------- Review & Commit API Routes -----------------------------------
+
+@flask_app.route('/api/enhanced/download-csv', methods=['POST'])
+def api_enhanced_download_csv():
+    """Download generated metadata as CSV (pre-commit)"""
+    try:
+        from flask import request, send_file
+        import io
+        import csv
+        from datetime import datetime
+        
+        data = request.get_json()
+        run_id = data.get('run_id')
+        selected_items = data.get('selected_items', [])  # List of full_names
+        
+        # Get setup manager for table configuration
+        setup_manager = get_setup_manager()
+        config = setup_manager.default_config
+        
+        # Build SQL query for results table
+        out_cat = config['output_catalog']
+        out_sch = config['output_schema']
+        out_tbl = config['results_table']
+        
+        # Build WHERE clause
+        where_conditions = ["status = 'generated'"]
+        
+        if run_id:
+            where_conditions.append(f"run_id = '{run_id}'")
+        
+        if selected_items:
+            # Escape single quotes in full_names
+            escaped_items = [item.replace("'", "''") for item in selected_items]
+            items_list = "', '".join(escaped_items)
+            where_conditions.append(f"full_name IN ('{items_list}')")
+        
+        where_clause = "WHERE " + " AND ".join(where_conditions)
+        
+        sql_statement = f"""
+            SELECT
+                full_name,
+                object_type,
+                proposed_comment,
+                confidence_score,
+                source_model,
+                generation_style,
+                pii_detected,
+                pii_tags,
+                policy_tags,
+                proposed_policy_tags,
+                data_classification,
+                generated_at
+            FROM {out_cat}.{out_sch}.{out_tbl}
+            {where_clause}
+            ORDER BY full_name
+        """
+        
+        # Execute query
+        future = run_async_in_thread(setup_manager._execute_sql(sql_statement))
+        result = future.result(timeout=30)
+        
+        if not result['success']:
+            return jsonify({"error": "Failed to fetch results"}), 500
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow([
+            'full_name',
+            'object_type',
+            'description',
+            'confidence_score',
+            'source_model',
+            'generation_style',
+            'pii_detected',
+            'pii_tags',
+            'policy_tags',
+            'proposed_policy_tags',
+            'data_classification',
+            'generated_at'
+        ])
+        
+        # Write data rows
+        for row in result.get('data', []):
+            writer.writerow(row)
+        
+        # Prepare file for download
+        output.seek(0)
+        csv_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
+        
+        # Generate filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'generated_metadata_{run_id or timestamp}.csv'
+        
+        return send_file(
+            csv_bytes,
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
+        
+    except Exception as e:
+        logger.error(f"Error downloading CSV: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 @flask_app.route("/api/enhanced/results")
 def api_enhanced_results():
@@ -1732,7 +2132,7 @@ def api_enhanced_results():
         # Get query parameters
         run_id = request.args.get("run_id")
         catalog = request.args.get("catalog")
-        limit = int(request.args.get("limit", "500"))
+        limit = int(request.args.get("limit", "10000"))  # Increased default from 500 to support large generation runs
         
         # Get setup manager for table configuration
         setup_manager = get_setup_manager()
@@ -2572,7 +2972,7 @@ def api_target_objects(catalog_name):
 
 @flask_app.route('/api/metadata/smart-match', methods=['POST'])
 def api_smart_match():
-    """Generate smart matches between source and target objects"""
+    """Generate smart matches between source and target objects (LEGACY - synchronous)"""
     try:
         from flask import request
         data = request.get_json()
@@ -2598,6 +2998,166 @@ def api_smart_match():
         
     except Exception as e:
         logger.error(f"Error in smart matching: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/smart-match-async', methods=['POST'])
+def api_smart_match_async():
+    """Start async smart match with progress tracking (OPTIMIZED)"""
+    try:
+        from flask import request
+        import uuid
+        import threading
+        
+        data = request.get_json()
+        source_objects = data.get('source_objects', [])
+        target_catalog = data.get('target_catalog')
+        target_schema = data.get('target_schema')  # Optional
+        
+        if not source_objects:
+            return jsonify({"error": "source_objects is required"}), 400
+        if not target_catalog:
+            return jsonify({"error": "target_catalog is required"}), 400
+        
+        # Create run ID
+        run_id = str(uuid.uuid4())
+        
+        # Initialize tracking dictionaries
+        if not hasattr(flask_app, 'smart_match_progress'):
+            flask_app.smart_match_progress = {}
+        if not hasattr(flask_app, 'smart_match_results'):
+            flask_app.smart_match_results = {}
+        
+        # Progress callback
+        def progress_callback(current, total, object_name):
+            flask_app.smart_match_progress[run_id] = {
+                'current': current,
+                'total': total,
+                'current_object': object_name,
+                'percentage': int((current / total) * 100) if total > 0 else 0
+            }
+        
+        # Cancellation check function
+        def is_cancelled():
+            if not hasattr(flask_app, 'smart_match_cancellations'):
+                return False
+            return run_id in flask_app.smart_match_cancellations
+        
+        # Background matching function
+        def run_smart_match_background():
+            try:
+                logger.info(f"🚀 Starting async smart match for run {run_id}")
+                flask_app.smart_match_progress[run_id] = {
+                    'current': 0,
+                    'total': len(source_objects),
+                    'current_object': 'Initializing...',
+                    'percentage': 0
+                }
+                
+                unity = get_unity_service()
+                copy_utils = MetadataCopyUtils(unity)
+                
+                result = copy_utils.smart_match_objects(
+                    source_objects, 
+                    target_catalog, 
+                    target_schema,
+                    progress_callback=progress_callback,
+                    cancellation_check=is_cancelled
+                )
+                
+                # Store results
+                flask_app.smart_match_results[run_id] = result
+                logger.info(f"✅ Smart match completed for run {run_id}: {len(result['matches'])} matches")
+                
+            except Exception as e:
+                logger.error(f"❌ Smart match failed for run {run_id}: {e}")
+                flask_app.smart_match_results[run_id] = {'error': str(e)}
+        
+        # Start background thread
+        thread = threading.Thread(target=run_smart_match_background, daemon=True)
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'run_id': run_id,
+            'total_objects': len(source_objects)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting async smart match: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/smart-match-status/<run_id>')
+def api_smart_match_status(run_id):
+    """Poll smart match progress"""
+    try:
+        if not hasattr(flask_app, 'smart_match_progress'):
+            return jsonify({'status': 'not_found'}), 404
+        
+        progress = flask_app.smart_match_progress.get(run_id)
+        results = flask_app.smart_match_results.get(run_id) if hasattr(flask_app, 'smart_match_results') else None
+        
+        if results:
+            # Check if it was cancelled
+            if results.get('cancelled'):
+                # Clean up progress tracking
+                if run_id in flask_app.smart_match_progress:
+                    del flask_app.smart_match_progress[run_id]
+                return jsonify({
+                    'status': 'cancelled',
+                    'results': results
+                })
+            
+            # Check if it's an error result
+            if 'error' in results:
+                return jsonify({
+                    'status': 'failed',
+                    'error': results['error']
+                })
+            
+            # Completed successfully
+            # Clean up progress tracking
+            if run_id in flask_app.smart_match_progress:
+                del flask_app.smart_match_progress[run_id]
+            
+            return jsonify({
+                'status': 'completed',
+                'results': results
+            })
+        elif progress:
+            return jsonify({
+                'status': 'running',
+                'progress': progress
+            })
+        else:
+            return jsonify({'status': 'not_found'}), 404
+        
+    except Exception as e:
+        logger.error(f"Error getting smart match status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@flask_app.route('/api/metadata/smart-match-cancel/<run_id>', methods=['POST'])
+def api_smart_match_cancel(run_id):
+    """Cancel a running smart match task"""
+    try:
+        # Set cancellation flag
+        if not hasattr(flask_app, 'smart_match_cancellations'):
+            flask_app.smart_match_cancellations = set()
+        
+        flask_app.smart_match_cancellations.add(run_id)
+        
+        logger.info(f"🛑 Cancellation requested for smart match run: {run_id}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Cancellation requested. Will return matches found so far.",
+            "run_id": run_id,
+            "timestamp": dt.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Error cancelling smart match: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2698,6 +3258,33 @@ def api_import_metadata():
         return jsonify({"error": str(e)}), 500
 
 
+@flask_app.route('/api/metadata/import-validate-tags', methods=['POST'])
+def api_import_validate_tags():
+    """Validate tags using REST API (checks governed tag values)"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        tags_to_validate = data.get('tags', [])
+        
+        if not tags_to_validate:
+            return jsonify({"error": "tags array is required"}), 400
+        
+        unity = get_unity_service()
+        copy_utils = MetadataCopyUtils(unity)
+        
+        result = copy_utils.validate_tags_via_api(tags_to_validate)
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        logger.error(f"Error validating tags: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @flask_app.route('/api/metadata/import-apply', methods=['POST'])
 def api_import_apply():
     """Apply imported metadata"""
@@ -2775,6 +3362,7 @@ def api_generate_improvements():
         
         data = request.get_json()
         objects = data.get('objects', [])  # List of {full_name, object_type, current_description}
+        model_id = data.get('model_id')  # Optional model selection
         
         if not objects:
             return jsonify({"error": "objects is required"}), 400
@@ -2789,10 +3377,18 @@ def api_generate_improvements():
         # Note: EnhancedMetadataGenerator expects (llm_service, unity_service, settings_manager)
         enhanced_gen = EnhancedMetadataGenerator(llm_service, unity, settings_mgr)
         
-        # Disable PII detection and data profiling for improvements (not needed when improving existing descriptions)
+        # Get sampling settings from Settings tab
+        sampling_config = settings_mgr.get_sampling_config() if settings_mgr else {'enable_sampling': True, 'sample_rows': 10}
+        
+        # Disable PII detection for improvements (not needed when improving existing descriptions)
+        # But RESPECT the user's sampling settings from Settings tab
         enhanced_gen.config['enable_pii_detection'] = False
         enhanced_gen.config['enable_data_profiling'] = False
-        logger.info("🔧 Disabled PII detection and data profiling for improvement generation")
+        enhanced_gen.config['enable_sampling'] = sampling_config.get('enable_sampling', True)
+        enhanced_gen.config['sample_rows'] = sampling_config.get('sample_rows', 10)
+        
+        sampling_status = "enabled" if enhanced_gen.config['enable_sampling'] else "disabled"
+        logger.info(f"🔧 Configured for improvement generation: PII detection OFF, sampling {sampling_status} ({enhanced_gen.config.get('sample_rows', 10)} rows)")
         
         # Process in background
         async def generate_improvements_async():
@@ -2807,25 +3403,49 @@ def api_generate_improvements():
                 
                 logger.info(f"📋 Processing {len(schemas)} schemas, {len(tables)} tables, {len(columns)} columns")
                 
+                # Track progress
+                total_objects = len(schemas) + len(tables) + len(columns)
+                processed = 0
+                
+                # Helper to update progress
+                def update_progress(current_object=''):
+                    nonlocal processed
+                    processed += 1
+                    if hasattr(flask_app, 'improvement_status') and run_id in flask_app.improvement_status:
+                        flask_app.improvement_status[run_id].update({
+                            'processed': processed,
+                            'total': total_objects,
+                            'current_object': current_object
+                        })
+                
                 # Check for cancellation flag
                 def is_cancelled():
                     if not hasattr(flask_app, 'improvement_cancellations'):
                         return False
                     return run_id in flask_app.improvement_cancellations
                 
-                # Get model from settings (settings_mgr already retrieved above)
-                if settings_mgr:
+                # Get model from parameter or settings
+                if model_id:
+                    model = model_id
+                    logger.info(f"Using user-selected model: {model}")
+                elif settings_mgr:
                     models_config_data = settings_mgr.get_models_config()
                     model = models_config_data.get('default_model', 'databricks-gpt-oss-20b')
+                    logger.info(f"Using default model from settings: {model}")
                 else:
                     model = 'databricks-gpt-oss-20b'
-                logger.info(f"Using model: {model}")
+                    logger.info(f"Using fallback model: {model}")
                 
                 # Generate for schemas
                 for schema_obj in schemas:
                     if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id}")
-                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                        flask_app.improvement_status[run_id] = {
+                            'status': 'cancelled',
+                            'improvements': improvements,
+                            'total': len(improvements),
+                            'message': 'Cancelled by user'
+                        }
                         return
                     
                     logger.info(f"🔄 Generating for schema: {schema_obj['full_name']}")
@@ -2850,6 +3470,7 @@ def api_generate_improvements():
                             'new_description': result.get('proposed_comment', ''),
                             'confidence': result.get('confidence_score', 0.0)
                         })
+                        update_progress(schema_obj['full_name'])
                 
                 # Generate for tables (batch by catalog)
                 tables_by_catalog = {}
@@ -2863,8 +3484,13 @@ def api_generate_improvements():
                 
                 for catalog, catalog_tables in tables_by_catalog.items():
                     if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id}")
-                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                        flask_app.improvement_status[run_id] = {
+                            'status': 'cancelled',
+                            'improvements': improvements,
+                            'total': len(improvements),
+                            'message': 'Cancelled by user'
+                        }
                         return
                     
                     logger.info(f"🔄 Generating for {len(catalog_tables)} tables in catalog {catalog}")
@@ -2898,6 +3524,7 @@ def api_generate_improvements():
                                 'new_description': results[i].get('proposed_comment', ''),
                                 'confidence': results[i].get('confidence_score', 0.0)
                             })
+                            update_progress(table_obj['full_name'])
                 
                 # Generate for columns (batch by table)
                 columns_by_table = {}
@@ -2911,18 +3538,35 @@ def api_generate_improvements():
                 
                 for table_key, table_columns in columns_by_table.items():
                     if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id}")
-                        flask_app.improvement_status[run_id] = {'status': 'cancelled'}
+                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                        flask_app.improvement_status[run_id] = {
+                            'status': 'cancelled',
+                            'improvements': improvements,
+                            'total': len(improvements),
+                            'message': 'Cancelled by user'
+                        }
                         return
                     
                     parts = table_key.split('.')
                     catalog, schema, table = parts[0], parts[1], parts[2]
                     logger.info(f"🔄 Generating for {len(table_columns)} columns in table {table_key}")
                     
-                    # Build column dicts with expected structure
+                    # OPTIMIZATION: Get column metadata with sample data ONCE for the entire table
+                    column_metadata = await enhanced_gen._get_table_columns_with_samples(
+                        catalog, schema, table
+                    )
+                    
+                    # Convert to a cache dict for fast lookup by column name
+                    table_sample_cache = {col['name']: col for col in column_metadata}
+                    logger.info(f"📦 Cached sample data for {len(table_sample_cache)} columns in {table_key}")
+                    
+                    # Build column dicts with expected structure including sample data
                     column_dicts = []
                     for col_obj in table_columns:
                         column_name = col_obj['full_name'].split('.')[3]
+                        # Find matching metadata (note: _get_table_columns_with_samples uses 'name' key, not 'column_name')
+                        col_meta = next((c for c in column_metadata if c['name'] == column_name), {})
+                        
                         column_dicts.append({
                             'name': column_name,
                             'full_name': col_obj['full_name'],
@@ -2930,14 +3574,16 @@ def api_generate_improvements():
                             'schema_name': schema,
                             'table_name': table,
                             'column_name': column_name,
-                            'data_type': '',
-                            'is_nullable': '',
-                            'column_default': '',
-                            'comment': col_obj['current_description']
+                            'data_type': col_meta.get('data_type', ''),
+                            'is_nullable': '',  # Not returned by _get_table_columns_with_samples
+                            'column_default': '',  # Not returned by _get_table_columns_with_samples
+                            'comment': col_obj['current_description'],
+                            'sample_values': col_meta.get('sample_values', [])  # Include samples for context!
                         })
                     
+                    # Pass the cache to avoid redundant sampling queries
                     result = await enhanced_gen._generate_column_chunk_metadata(
-                        column_dicts, model, run_id
+                        column_dicts, model, run_id, is_improvement=True, table_sample_cache=table_sample_cache
                     )
                     
                     # _generate_column_chunk_metadata returns a dict with 'metadata' key containing list of results
@@ -2951,6 +3597,7 @@ def api_generate_improvements():
                                 'new_description': metadata_list[i].get('proposed_comment', ''),
                                 'confidence': metadata_list[i].get('confidence_score', 0.0)
                             })
+                            update_progress(col_obj['full_name'])
                 
                 # Store results
                 if not hasattr(flask_app, 'improvement_status'):
@@ -2981,7 +3628,8 @@ def api_generate_improvements():
         flask_app.improvement_status[run_id] = {
             'status': 'running',
             'total': len(objects),
-            'processed': 0
+            'processed': 0,
+            'current_object': 'Initializing...'
         }
         
         # Start async generation using run_async_in_thread (enhanced_gen methods are async)
@@ -3064,6 +3712,66 @@ def api_cancel_improvements(run_id):
         
     except Exception as e:
         logger.error(f"Error cancelling improvement: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route('/api/metadata/download-improvements-csv', methods=['POST'])
+def api_download_improvements_csv():
+    """Download improved metadata as CSV (pre-commit)"""
+    try:
+        from flask import request, send_file
+        import io
+        import csv
+        from datetime import datetime
+        
+        data = request.get_json()
+        improvements = data.get('improvements', [])
+        
+        if not improvements:
+            return jsonify({"error": "No improvements provided"}), 400
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow([
+            'full_name',
+            'object_type',
+            'current_description',
+            'improved_description',
+            'quality_score',
+            'quality_category'
+        ])
+        
+        # Write data rows
+        for improvement in improvements:
+            writer.writerow([
+                improvement.get('full_name', ''),
+                improvement.get('object_type', ''),
+                improvement.get('current_description', ''),
+                improvement.get('improved_description', ''),
+                improvement.get('quality_score', ''),
+                improvement.get('quality_category', '')
+            ])
+        
+        # Prepare file for download
+        output.seek(0)
+        csv_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
+        
+        # Generate filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'improved_metadata_{timestamp}.csv'
+        
+        return send_file(
+            csv_bytes,
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
+        
+    except Exception as e:
+        logger.error(f"Error downloading improvements CSV: {e}")
         return jsonify({"error": str(e)}), 500
 
 

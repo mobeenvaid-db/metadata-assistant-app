@@ -35,6 +35,17 @@ class EnhancedMetadataGenerator:
         self.settings_manager = settings_manager
         self.pii_detector = PIIDetector(settings_manager, llm_service, unity_service)
         self.progress_callback = None
+        self.progress_offset = 0  # For multi-model cumulative progress tracking
+        
+        # Performance Caches (shared across models to avoid redundant queries)
+        self.pii_cache = {}  # Key: "catalog.schema.table.column" -> PII result
+        self.column_metadata_cache = {}  # Key: "catalog.schema.table" -> [column_names]
+        self.sample_data_cache = {}  # Key: "catalog.schema.table" -> sample data
+        self.schema_tables_cache = {}  # Key: "catalog.schema" -> [table_info]
+        
+        # Resume on Failure Support
+        self.incremental_save_callback = None  # Callback to save results incrementally
+        self.completed_objects = set()  # Track completed objects for resume capability
         
         # Configuration - mirrors dbxmetagen variables.yml
         # Read sampling config from settings if available
@@ -193,6 +204,34 @@ class EnhancedMetadataGenerator:
         self._last_progress_update = 0  # Timestamp for throttling
         self._progress_throttle_seconds = 0.5  # Update max once per 0.5 seconds
     
+    def set_incremental_save_callback(self, callback):
+        """Set callback for incremental result saving (resume on failure support)"""
+        self.incremental_save_callback = callback
+    
+    async def _save_checkpoint(self, results_batch: List[Dict], run_id: str):
+        """
+        Save a checkpoint of completed results (RESUME ON FAILURE support).
+        
+        This ensures users never lose work - even if the job times out after 450/700 objects,
+        those 450 results are saved and can be resumed from.
+        """
+        if not self.incremental_save_callback or not results_batch:
+            return
+        
+        try:
+            # Save batch incrementally
+            await self.incremental_save_callback(results_batch, run_id)
+            
+            # Track completed objects for resume
+            for result in results_batch:
+                self.completed_objects.add(result['full_name'])
+                
+            logger.info(f"💾 Checkpoint: Saved {len(results_batch)} results (total saved: {len(self.completed_objects)})")
+            
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            # Don't fail the entire generation if checkpoint fails - continue processing
+    
     def _update_progress(self, **kwargs):
         """
         Update progress if callback is set (ZERO OVERHEAD with aggressive throttling).
@@ -216,6 +255,10 @@ class EnhancedMetadataGenerator:
                 if time_since_last < self._progress_throttle_seconds:
                     return  # Skip this update (too soon)
             
+            # Apply progress offset for multi-model mode (cumulative progress)
+            if 'processed_objects' in kwargs and self.progress_offset > 0:
+                kwargs['processed_objects'] = kwargs['processed_objects'] + self.progress_offset
+            
             # Only update if we have meaningful changes
             if kwargs:
                 self.progress_callback(**kwargs)
@@ -225,7 +268,7 @@ class EnhancedMetadataGenerator:
             # Use debug level to avoid log spam during generation
             logger.debug(f"Progress callback error: {e}")
     
-    async def generate_enhanced_metadata(self, catalog_name: str, model: str, selected_objects: Dict = None, run_id: str = None, pii_model: str = None) -> Dict:
+    async def generate_enhanced_metadata(self, catalog_name: str, model: str, selected_objects: Dict = None, run_id: str = None, pii_model: str = None, progress_offset: int = 0) -> Dict:
         """
         Generate enhanced metadata for entire catalog with PII detection and data profiling
         
@@ -244,6 +287,9 @@ class EnhancedMetadataGenerator:
         
         # Store pii_model for use in nested methods
         self._current_pii_model = pii_model
+        
+        # Store progress offset for multi-model cumulative tracking
+        self.progress_offset = progress_offset
             
         logger.info(f"Starting enhanced metadata generation for {catalog_name} (metadata: {model}, PII: {pii_model})")
         
@@ -362,6 +408,9 @@ class EnhancedMetadataGenerator:
                             if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
                                 results['summary']['high_confidence_results'] += 1
                         
+                        # CHECKPOINT: Save batch results incrementally (resume on failure support)
+                        await self._save_checkpoint(batch_metadata, run_id)
+                        
                         return len(batch_metadata)
                                 
                     except Exception as e:
@@ -430,6 +479,9 @@ class EnhancedMetadataGenerator:
                                 results['summary']['pii_objects_detected'] += 1
                             if metadata.get('confidence_score', 0) >= self.config['confidence_threshold']:
                                 results['summary']['high_confidence_results'] += 1
+                        
+                        # CHECKPOINT: Save batch results incrementally (resume on failure support)
+                        await self._save_checkpoint(batch_metadata, run_id)
                         
                         return len(batch_metadata)
                                 
@@ -867,6 +919,34 @@ class EnhancedMetadataGenerator:
             if "Requirements:" in template_prompt:
                 requirements_section = template_prompt.split("Requirements:")[1]
                 batch_prompt += "Requirements:" + requirements_section
+            
+            # ADD CRITICAL BATCH-SPECIFIC FORMAT INSTRUCTIONS
+            # This is essential for robust parsing across different LLM models
+            batch_prompt += f"""
+
+🎯 CRITICAL OUTPUT FORMAT FOR BATCH RESPONSES:
+YOU MUST return exactly {len(tables)} descriptions in this EXACT format:
+
+1. Description for first table
+2. Description for second table
+3. Description for third table
+...and so on
+
+STRICT RULES:
+- Start each line with the number followed by a period and space: "1. ", "2. ", "3. "
+- Do NOT include table names in the response
+- Do NOT use bold/italic markers like **text** or *text*
+- Do NOT use headers or section dividers
+- Each description should be plain text on its own line
+- Descriptions can span multiple lines, but must start with the number
+- Do NOT add extra blank lines between descriptions
+
+EXAMPLE (for 3 tables):
+1. Stores customer transaction data including purchase amounts and dates, supporting financial reporting and revenue analysis.
+2. Contains product catalog information with pricing and inventory levels for e-commerce operations.
+3. Maintains employee records and organizational hierarchy for HR management and reporting purposes.
+
+Return exactly {len(tables)} numbered descriptions in the format above. This format is MANDATORY for proper parsing."""
         
         # Validate prompt size - if too large, recursively split
         if not self._validate_prompt_size(batch_prompt, len(tables), 'table'):
@@ -980,11 +1060,27 @@ class EnhancedMetadataGenerator:
                 break
             
             try:
-                # Get sample data for all columns in this table
-                enriched_columns = await self._enrich_columns_with_samples(table_columns)
+                # OPTIMIZATION: Sample the table ONCE for all columns, then reuse for each chunk
+                # This dramatically reduces database queries for wide tables (50+ columns)
+                table_sample_cache = None
+                if table_columns:
+                    first_col = table_columns[0]
+                    catalog_name = first_col['catalog_name']
+                    schema_name = first_col['schema_name']
+                    table_name = first_col['table_name']
+                    
+                    # Sample ALL columns from this table once
+                    all_column_samples = await self._get_table_columns_with_samples(
+                        catalog_name, schema_name, table_name
+                    )
+                    
+                    # Convert to a dict for fast lookup by column name
+                    table_sample_cache = {col['name']: col for col in all_column_samples}
+                    logger.info(f"📦 Cached sample data for {len(table_sample_cache)} columns in {table_key}")
                 
-                # Process in chunks
-                chunks = self._create_optimal_chunks(enriched_columns)
+                # OPTIMIZATION: For wide tables, create chunks first, then sample per-chunk
+                # This prevents sampling 1000+ columns upfront for very wide tables
+                chunks = self._create_optimal_chunks(table_columns)
                 
                 for chunk in chunks:
                     # Check for cancellation before processing each chunk
@@ -994,13 +1090,16 @@ class EnhancedMetadataGenerator:
                     
                     try:
                         chunk_results = await self._generate_column_chunk_metadata(
-                            chunk, model, run_id
+                            chunk, model, run_id, table_sample_cache=table_sample_cache
                         )
                         
                         results['metadata'].extend(chunk_results['metadata'])
                         results['processed'] += chunk_results['processed']
                         results['pii_detected'] += chunk_results['pii_detected']
                         results['high_confidence'] += chunk_results['high_confidence']
+                        
+                        # CHECKPOINT: Save chunk results incrementally (resume on failure support)
+                        await self._save_checkpoint(chunk_results['metadata'], run_id)
                         
                         # Batch progress updates: Only update every 5 chunks or for large chunks to reduce overhead
                         if len(chunk) >= 5 or results['processed'] % 50 == 0:
@@ -1024,18 +1123,31 @@ class EnhancedMetadataGenerator:
         
         return results
     
-    async def _generate_column_chunk_metadata(self, columns: List[Dict], model: str, run_id: str = None) -> Dict:
-        """Generate metadata for a chunk of columns with shared context"""
+    async def _generate_column_chunk_metadata(self, columns: List[Dict], model: str, run_id: str = None, is_improvement: bool = False, table_sample_cache: Dict = None) -> Dict:
+        """Generate metadata for a chunk of columns with shared context
+        
+        Args:
+            columns: List of column dicts
+            model: LLM model to use
+            run_id: Optional run ID for progress tracking
+            is_improvement: If True, uses improvement prompt instead of generation prompt
+            table_sample_cache: Optional pre-cached sample data for the table to avoid re-querying
+        """
         if not columns:
             return {'metadata': [], 'processed': 0, 'pii_detected': 0, 'high_confidence': 0}
         
+        # OPTIMIZATION: Sample data for this specific chunk only (not entire table)
+        # This makes processing 1000+ column tables much more efficient
+        # If table_sample_cache is provided, use it instead of re-querying
+        enriched_columns = await self._enrich_columns_with_samples(columns, table_sample_cache=table_sample_cache)
+        
         # All columns in chunk are from same table
-        first_col = columns[0]
+        first_col = enriched_columns[0]
         table_context = {
             'catalog_name': first_col['catalog_name'],
             'schema_name': first_col['schema_name'],
             'table_name': first_col['table_name'],
-            'columns': columns
+            'columns': enriched_columns
         }
         
         results = {
@@ -1045,8 +1157,11 @@ class EnhancedMetadataGenerator:
             'high_confidence': 0
         }
         
-        # Build batch prompt for efficiency
-        prompt = self._build_column_batch_prompt(table_context)
+        # Build appropriate prompt based on mode
+        if is_improvement:
+            prompt = self._build_improvement_prompt(table_context)
+        else:
+            prompt = self._build_column_batch_prompt(table_context)
         
         # Log sample data availability
         columns_with_samples = sum(1 for col in columns if col.get('sample_values'))
@@ -1084,6 +1199,13 @@ class EnhancedMetadataGenerator:
                 for col in columns
             ]
         
+        # Add descriptions to column dicts BEFORE PII detection (so PII detector can use them)
+        for i, col in enumerate(columns):
+            if i < len(descriptions):
+                col['description'] = descriptions[i]
+        
+        logger.debug(f"📝 Enriched {len(columns)} columns with generated descriptions for PII analysis")
+        
         # Batch PII analysis for all columns (much more efficient than per-column calls)
         pii_enabled = self.config['enable_pii_detection']
         if self.settings_manager and pii_enabled:
@@ -1095,12 +1217,31 @@ class EnhancedMetadataGenerator:
         
         pii_analyses_by_column = {}
         if pii_enabled:
-            # Single batch call for all columns with specified PII model
-            # pii_model is passed from the outer scope (generate_enhanced_metadata method)
-            pii_model_to_use = getattr(self, '_current_pii_model', None)
-            pii_results = self.pii_detector.analyze_columns_batch(columns, llm_model=pii_model_to_use)
-            for col, pii_result in zip(columns, pii_results):
-                pii_analyses_by_column[col['column_name']] = pii_result
+            # Check PII cache first (PII is data-based, shared across models)
+            columns_needing_pii = []
+            for col in columns:
+                cache_key = f"{col['catalog_name']}.{col['schema_name']}.{col['table_name']}.{col['column_name']}"
+                if cache_key in self.pii_cache:
+                    # Cache hit! Reuse PII result from previous model
+                    pii_analyses_by_column[col['column_name']] = self.pii_cache[cache_key]
+                    logger.debug(f"♻️ PII cache hit for {col['column_name']}")
+                else:
+                    # Cache miss - need to analyze this column
+                    columns_needing_pii.append(col)
+            
+            # Only call PII detector for columns not in cache
+            if columns_needing_pii:
+                logger.info(f"🔒 Analyzing {len(columns_needing_pii)} new columns for PII (cached: {len(columns) - len(columns_needing_pii)})")
+                pii_model_to_use = getattr(self, '_current_pii_model', None)
+                pii_results = self.pii_detector.analyze_columns_batch(columns_needing_pii, llm_model=pii_model_to_use)
+                
+                # Store results in both local dict and persistent cache
+                for col, pii_result in zip(columns_needing_pii, pii_results):
+                    cache_key = f"{col['catalog_name']}.{col['schema_name']}.{col['table_name']}.{col['column_name']}"
+                    pii_analyses_by_column[col['column_name']] = pii_result
+                    self.pii_cache[cache_key] = pii_result  # Cache for next model
+            else:
+                logger.info(f"♻️ All {len(columns)} columns found in PII cache - skipping detection")
         
         # Process each column
         for i, column in enumerate(columns):
@@ -1124,6 +1265,11 @@ class EnhancedMetadataGenerator:
                 # Use proposed tags instead of automatic tags
                 proposed_policy_tags = pii_analysis['proposed_policy_tags'] if pii_analysis else []
                 policy_tags = []  # No automatic tags - only proposed ones
+                
+                # Log PII detection for debugging
+                if pii_detected:
+                    tag_status = f"{len(proposed_policy_tags)} tags proposed" if proposed_policy_tags else "no tags proposed (may conflict with governed tags)"
+                    logger.debug(f"🔒 PII detected for {column['column_name']}: classification={classification}, types={pii_tags}, {tag_status}")
                 
                 metadata = {
                     'run_id': run_id,
@@ -1409,6 +1555,111 @@ Example: "The table stores customer transaction data including purchase amounts 
             'custom_examples': []
         }
     
+    def _build_improvement_prompt(self, context: Dict) -> str:
+        """Build prompt specifically for improving existing descriptions"""
+        table_name = context['table_name']
+        columns = context['columns']
+        
+        prompt = f"""
+TASK: Improve the existing descriptions for columns in table '{table_name}'.
+
+CRITICAL EVALUATION REQUIRED:
+First, evaluate the quality of each current description:
+
+REPLACE COMPLETELY if the description is:
+- Nonsensical or placeholder text (e.g., "my name is jim", "test data", "TODO", "N/A")
+- Personal comments or unrelated content (e.g., "john was here", "for bob's team")
+- Generic/meaningless (e.g., "data field", "column", "information")
+- Completely wrong for the column name and data type shown
+- Empty, minimal, or unhelpful (e.g., "id", "name field")
+
+ENHANCE AND PRESERVE if the description:
+- Contains valuable business context and organizational significance
+- Shows understanding of the data's purpose and usage
+- Is mostly correct but could be clearer or more concise
+- Has good business meaning but awkward phrasing
+
+When in doubt: If the description seems professional and relevant, improve it. If it seems like test/placeholder/nonsense, replace it entirely.
+
+"""
+        
+        for i, col in enumerate(columns, 1):
+            current_desc = col.get('comment', '').strip()
+            sample_values = col.get('sample_values', [])
+            
+            # Format sample values
+            if sample_values:
+                samples_preview = []
+                for v in sample_values[:3]:
+                    if v is None:
+                        samples_preview.append('NULL')
+                    else:
+                        v_str = str(v)
+                        if len(v_str) > 50:
+                            v_str = v_str[:47] + '...'
+                        samples_preview.append(f"'{v_str}'")
+                samples_str = ', '.join(samples_preview)
+            else:
+                samples_str = '(no samples available)'
+            
+            prompt += f"""
+{i}. Column: {col['column_name']}
+   Type: {col['data_type']}
+   Sample values: {samples_str}
+   CURRENT DESCRIPTION: "{current_desc}"
+
+"""
+        
+        prompt_config = self._get_prompt_config()
+        length_config = prompt_config.get('description_length', 'standard')
+        if isinstance(length_config, dict):
+            description_length = length_config.get('column', 'concise')
+        else:
+            description_length = length_config
+        
+        length_guidance = {
+            'concise': "Keep improved descriptions brief and direct (1 short sentence, ~15-25 words).",
+            'standard': "Provide clear, professional improvements (1-2 sentences, ~30-50 words).",
+            'detailed': "Generate comprehensive improvements with business context (2-3 sentences, ~60-100 words)."
+        }
+        
+        prompt += f"\nIMPROVEMENT GUIDELINES:"
+        prompt += f"\n- For BAD descriptions: Generate a completely new, professional description from scratch based on column name, data type, and sample values"
+        prompt += f"\n- For GOOD descriptions: Preserve valuable business context and enhance clarity/precision"
+        prompt += f"\n- Add insights from sample data without mentioning specific values"
+        prompt += f"\n- Remove redundancy, awkward phrasing, or technical jargon"
+        prompt += f"\n- If current description is excellent, make only minor improvements"
+        prompt += f"\n- Focus on business value and organizational significance"
+        prompt += f"\n\nLength: {length_guidance.get(description_length, length_guidance['standard'])}"
+        
+        prompt += f"\n\nEXAMPLES:"
+        prompt += f"\n"
+        prompt += f"\nExample 1 - BAD description to REPLACE:"
+        prompt += f"\n  Column: customer_id | Type: STRING | Samples: 'C12345', 'C67890'"
+        prompt += f"\n  Current: 'my name is jim'"
+        prompt += f"\n  Improved: 'Unique identifier for customers, used to link transactions and track customer relationships across systems.'"
+        prompt += f"\n"
+        prompt += f"\nExample 2 - GOOD description to ENHANCE:"
+        prompt += f"\n  Column: order_date | Type: DATE | Samples: '2024-01-15', '2024-01-16'"
+        prompt += f"\n  Current: 'This column stores the date when customer places order, enabling time-based analysis for business intelligence reporting.'"
+        prompt += f"\n  Improved: 'Records the date when a customer places an order, enabling time-series analysis and business intelligence reporting.'"
+        prompt += f"\n"
+        prompt += f"\n\nOUTPUT FORMAT (CRITICAL - FOLLOW EXACTLY):"
+        prompt += f"\nReturn exactly {len(columns)} improved descriptions, numbered as shown below."
+        prompt += f"\nFormat: '1. description text' (NOT '1-1.' or '1:' or any other format)"
+        prompt += "\nDo NOT add preamble, headers, section labels, or markdown formatting."
+        prompt += "\nJust the numbered list of improved descriptions, nothing else."
+        prompt += f"\n\nExpected output structure:"
+        prompt += f"\n1. [improved description for column 1]"
+        prompt += f"\n2. [improved description for column 2]"
+        if len(columns) > 2:
+            prompt += f"\n3. [improved description for column 3]"
+            if len(columns) > 3:
+                prompt += f"\n..."
+                prompt += f"\n{len(columns)}. [improved description for column {len(columns)}]"
+        
+        return prompt.strip()
+    
     def _build_column_batch_prompt(self, context: Dict) -> str:
         """Build batch prompt for multiple columns with sample data awareness"""
         table_name = context['table_name']
@@ -1497,22 +1748,72 @@ Generate professional descriptions for the following columns in table '{table_na
             prompt += f"\n\nADDITIONAL REQUIREMENTS:\n{additional_instructions}"
             logger.info(f"📝 Added custom instructions to prompt: {additional_instructions[:100]}{'...' if len(additional_instructions) > 100 else ''}")
         
-        prompt += f"\n\nOUTPUT FORMAT:"
-        prompt += f"\nReturn exactly {len(columns)} descriptions, numbered 1-{len(columns)}."
-        prompt += "\nDo NOT add preamble text, headers, or labels like 'Description:' or 'Column:'."
-        prompt += "\nDo not mention specific sample values in descriptions - use them only to understand the data patterns."
-        prompt += "\n\nExample format:"
-        prompt += "\n1. Stores the unique identifier for..."
-        prompt += "\n2. Represents the customer's primary..."
+        prompt += f"""
+
+🎯 CRITICAL OUTPUT FORMAT FOR BATCH RESPONSES:
+YOU MUST return exactly {len(columns)} descriptions in this EXACT format:
+
+1. Description for first column
+2. Description for second column
+3. Description for third column
+...and so on
+
+STRICT RULES:
+- Start each line with the number followed by a period and space: "1. ", "2. ", "3. "
+- Do NOT include column names in the descriptions (they're already in the context above)
+- Do NOT use bold/italic markers like **text** or *text*
+- Do NOT use headers, labels, or prefixes like "Column:", "Description:", "Output:"
+- Each description should be plain text starting immediately after the number
+- Do NOT add extra blank lines between descriptions
+- Do NOT mention specific sample values in descriptions (use them only to infer patterns)
+
+EXAMPLE (for 3 columns):
+1. Stores the unique identifier for tracking transactions across systems.
+2. Represents the customer's primary email address for communication purposes.
+3. Contains the transaction amount in USD for financial reporting and analysis.
+
+Return exactly {len(columns)} numbered descriptions in the format above. This format is MANDATORY for proper parsing."""
         
         return prompt.strip()
     
     def _parse_batch_response(self, response: str, columns: List[Dict]) -> List[str]:
-        """Parse LLM batch response into individual descriptions (handles nested/multi-line responses)"""
+        """Parse LLM batch response into individual descriptions (handles nested/multi-line responses)
+        
+        Uses aggressive preprocessing to handle format variations from different LLM models.
+        """
         if not response or not columns:
             return []
         
-        lines = response.strip().split('\n')
+        # PREPROCESSING: Normalize various formats (same as table parsing)
+        preprocessed_response = response
+        preprocessing_applied = []
+        
+        # Remove bold/italic markers
+        if '*' in preprocessed_response or '_' in preprocessed_response:
+            preprocessed_response = re.sub(r'[*_]([^*_]+)[*_]', r'\1', preprocessed_response)
+            preprocessing_applied.append('markdown_formatting')
+        
+        # Remove "Column:" or "Description:" labels inline
+        if re.search(r'^\d+\.\s+(Column|Description):', preprocessed_response, re.MULTILINE):
+            preprocessed_response = re.sub(r'^(\d+\.)\s+(Column|Description):\s*', r'\1 ', preprocessed_response, flags=re.MULTILINE)
+            preprocessing_applied.append('inline_labels')
+        
+        # Handle bullet points → numbers
+        lines_with_bullets = [l for l in preprocessed_response.split('\n') if l.strip().startswith('-')]
+        if len(lines_with_bullets) >= len(columns):
+            line_num = 1
+            def replace_bullet(match):
+                nonlocal line_num
+                result = f"{line_num}. "
+                line_num += 1
+                return result
+            preprocessed_response = re.sub(r'^\s*-\s+', replace_bullet, preprocessed_response, flags=re.MULTILINE)
+            preprocessing_applied.append('bullets_to_numbers')
+        
+        if preprocessing_applied:
+            logger.debug(f"🔧 Column parsing preprocessing: {', '.join(preprocessing_applied)}")
+        
+        lines = preprocessed_response.strip().split('\n')
         descriptions = []
         current_column_text = ""
         in_column_block = False
@@ -1522,9 +1823,9 @@ Generate professional descriptions for the following columns in table '{table_na
             if not line:
                 continue
             
-            # Check if this line starts a new MAIN column item (e.g., "1. **Column ABC1**", "1. Column: ABC1")
-            # Match both "Column:" and "Column " formats
-            if re.match(r'^\d+\.\s+(\*\*)?Column[:\s]', line):
+            # Check if this line starts a new MAIN column item (e.g., "1. **Column ABC1**", "1. Column: ABC1", "1-1. Column ABC1")
+            # Match both "Column:" and "Column " formats, and handle variations like "1." or "1-1."
+            if re.match(r'^\d+[-.]?\d*\.\s+(\*\*)?Column[:\s]', line):
                 # Save previous column description if exists
                 if current_column_text:
                     # Extract only the FIRST sentence/sub-item as the description
@@ -1532,7 +1833,8 @@ Generate professional descriptions for the following columns in table '{table_na
                     descriptions.append(first_desc)
                 
                 # Start new column block - extract column name and any following text
-                current_column_text = re.sub(r'^\d+\.\s+', '', line)
+                # Handle both "1." and "1-1." formats
+                current_column_text = re.sub(r'^\d+[-.]?\d*\.\s+', '', line)
                 # Remove markdown bold wrappers (e.g., "**Column ABC1**" -> "Column ABC1")
                 current_column_text = re.sub(r'^\*\*Column[:\s]([^*]+)\*\*', r'Column \1', current_column_text)
                 # Remove "Column: name" or "Column name" prefix
@@ -1550,16 +1852,18 @@ Generate professional descriptions for the following columns in table '{table_na
         
         # If we didn't find column blocks, try the old simple numbered parsing
         if len(descriptions) == 0:
-            logger.warning(f"⚠️ No column blocks found, trying simple numbered parsing")
+            logger.debug(f"No column blocks found, using simple numbered parsing")
             current_desc = ""
             for line in lines:
                 line = line.strip()
                 if not line:
                     continue
-                if re.match(r'^\d+\.\s+', line) and not re.match(r'^\s+\d+\.', line):  # Top-level numbers only
+                # Match "1." or "1-1." or similar patterns, but only at top level
+                if re.match(r'^\d+[-.]?\d*\.\s+', line) and not re.match(r'^\s+\d+\.', line):  # Top-level numbers only
                     if current_desc:
                         descriptions.append(current_desc.strip())
-                    current_desc = re.sub(r'^\d+\.\s+', '', line)
+                    # Strip the number prefix (handles both "1." and "1-1." formats)
+                    current_desc = re.sub(r'^\d+[-.]?\d*\.\s+', '', line)
                 else:
                     if current_desc:
                         current_desc += " " + line
@@ -1576,8 +1880,9 @@ Generate professional descriptions for the following columns in table '{table_na
     
     def _extract_first_description(self, text: str) -> str:
         """Extract the first meaningful description from potentially nested text"""
-        # Look for the first numbered sub-item (e.g., "1. This column stores...")
-        match = re.search(r'\s*\d+\.\s+(.+?)(?:\s+\d+\.|$)', text, re.DOTALL)
+        # Look for the first numbered sub-item (e.g., "1. This column stores..." or "1-1. This column stores...")
+        # Handle variations like "1." or "1-1." or "1-2."
+        match = re.search(r'\s*\d+[-.]?\d*\.\s+(.+?)(?:\s+\d+[-.]?\d*\.|$)', text, re.DOTALL)
         if match:
             result = match.group(1).strip()
         else:
@@ -1617,14 +1922,69 @@ Generate professional descriptions for the following columns in table '{table_na
                 clean_text = re.sub(r'^1\.\s+', '', clean_text)
                 # Remove "Description:" prefix if present
                 clean_text = re.sub(r'^Description:\s*', '', clean_text, flags=re.IGNORECASE)
+                # Remove bold table names like **table_name**
+                clean_text = re.sub(r'^\*\*[^*]+\*\*\s*', '', clean_text)
                 return [clean_text.strip()]
             
-            # Split by numbered lines (1., 2., etc.)
-            lines = response_text.strip().split('\n')
+            # Try multiple parsing strategies
             descriptions = []
             
+            # ========================================
+            # STAGE 1: AGGRESSIVE PREPROCESSING
+            # ========================================
+            # Handle multiple format variations that different LLMs produce
+            # Goal: Normalize various formats into: "1. Description\n2. Description\n..."
+            
+            preprocessed_text = response_text
+            
+            # Track which preprocessing steps were needed (for model behavior analysis)
+            preprocessing_applied = []
+            
+            # Remove bold table name headers: **1. schema.table** → 1.
+            if re.search(r'\*\*\d+\.', preprocessed_text):
+                preprocessed_text = re.sub(r'\*\*(\d+)\.\s+[^*]+\*\*\s*\n?', r'\1. ', preprocessed_text)
+                preprocessing_applied.append('bold_headers')
+            
+            # Remove italic markers: *text* or _text_ → text
+            if '*' in preprocessed_text or '_' in preprocessed_text:
+                preprocessed_text = re.sub(r'[*_]([^*_]+)[*_]', r'\1', preprocessed_text)
+                preprocessing_applied.append('italic_markers')
+            
+            # Remove markdown headers: ### Header or ## Header → Header
+            if '#' in preprocessed_text:
+                preprocessed_text = re.sub(r'^#+\s*', '', preprocessed_text, flags=re.MULTILINE)
+                preprocessing_applied.append('markdown_headers')
+            
+            # Handle hyphenated list format: "- Description" → "1. Description"
+            # (Some models use bullet points instead of numbers)
+            lines_with_hyphens = [l for l in preprocessed_text.split('\n') if l.strip().startswith('-')]
+            if len(lines_with_hyphens) >= expected_count:
+                line_num = 1
+                def replace_hyphen(match):
+                    nonlocal line_num
+                    result = f"{line_num}. "
+                    line_num += 1
+                    return result
+                preprocessed_text = re.sub(r'^\s*-\s+', replace_hyphen, preprocessed_text, flags=re.MULTILINE)
+                preprocessing_applied.append('hyphen_to_number')
+            
+            # Handle "Table 1:", "Item 1:", "Description 1:" prefixes → "1. "
+            if re.search(r'(Table|Item|Description)\s+\d+:', preprocessed_text, re.IGNORECASE):
+                preprocessed_text = re.sub(r'(?:Table|Item|Description)\s+(\d+):\s*', r'\1. ', preprocessed_text, flags=re.IGNORECASE)
+                preprocessing_applied.append('prefix_labels')
+            
+            # Remove "Description:" or "Output:" labels
+            if 'Description:' in preprocessed_text or 'Output:' in preprocessed_text:
+                preprocessed_text = re.sub(r'^(Description|Output):\s*', '', preprocessed_text, flags=re.IGNORECASE | re.MULTILINE)
+                preprocessing_applied.append('description_labels')
+            
+            if preprocessing_applied:
+                logger.info(f"🔧 Applied preprocessing steps: {', '.join(preprocessing_applied)}")
+            
+            # Strategy 1: Try numbered format (1., 2., 3., etc.)
+            lines = preprocessed_text.strip().split('\n')
             current_desc = ""
-            found_first_item = False  # Track if we've found the first numbered item
+            found_first_item = False
             
             for line in lines:
                 line = line.strip()
@@ -1638,10 +1998,9 @@ Generate professional descriptions for the following columns in table '{table_na
                         descriptions.append(current_desc.strip())
                     # Start new description (remove number)
                     current_desc = re.sub(r'^\d+\.\s+', '', line)
-                    found_first_item = True  # Mark that we've started parsing items
+                    found_first_item = True
                 else:
                     # Continue current description (but ONLY if we've found the first numbered item)
-                    # This skips preamble text like "Here are the professional descriptions:"
                     if found_first_item and current_desc:
                         current_desc += " " + line
             
@@ -1649,10 +2008,96 @@ Generate professional descriptions for the following columns in table '{table_na
             if current_desc:
                 descriptions.append(current_desc.strip())
             
-            # Ensure we have enough descriptions
+            # Strategy 2: If numbered format didn't work, try newline-separated paragraphs
+            if len(descriptions) < expected_count:
+                logger.debug(f"Numbered format found {len(descriptions)} items, trying paragraph format")
+                descriptions = []
+                
+                # Use preprocessed text (already has bold markers removed)
+                # Also remove any remaining bold markers in the description text itself
+                cleaned_text = re.sub(r'\*\*[^*]+\*\*\s*\n?', '', preprocessed_text)
+                
+                # Split by double newlines OR single newlines if we have enough sentences
+                # First try double newlines (paragraph breaks)
+                paragraphs = [p.strip() for p in cleaned_text.split('\n\n') if p.strip()]
+                
+                if len(paragraphs) >= expected_count:
+                    # We have enough paragraphs
+                    descriptions = paragraphs
+                else:
+                    # Try single newlines - each non-empty line is a description
+                    single_lines = [line.strip() for line in cleaned_text.split('\n') if line.strip()]
+                    
+                    # Filter out very short lines (likely headers or noise)
+                    meaningful_lines = [line for line in single_lines if len(line) > 30]
+                    
+                    if len(meaningful_lines) >= expected_count:
+                        descriptions = meaningful_lines
+                    elif len(single_lines) >= expected_count:
+                        # Use all lines if meaningful filtering removed too many
+                        descriptions = single_lines
+            
+            # Strategy 3: If still not enough, try splitting by sentence patterns
+            # Some models return descriptions in a single block separated by periods
+            if len(descriptions) < expected_count:
+                logger.debug(f"Paragraph format found {len(descriptions)} items, trying sentence splitting")
+                # Split on patterns like ". \n" or ". [Capital letter]"
+                sentences = re.split(r'\.\s+(?=[A-Z])', preprocessed_text.strip())
+                sentences = [s.strip() + ('.' if not s.endswith('.') else '') for s in sentences if s.strip()]
+                
+                if len(sentences) >= expected_count:
+                    descriptions = sentences
+            
+            # ========================================
+            # STAGE 2: INTELLIGENT FALLBACK
+            # ========================================
+            # If all parsing strategies failed, try to extract ANY useful content
+            if len(descriptions) < expected_count:
+                logger.warning(f"⚠️ Standard parsing yielded {len(descriptions)}/{expected_count} descriptions, trying intelligent fallback")
+                
+                # Split text into any substantial chunks (30+ chars) and take the first N
+                all_text_chunks = preprocessed_text.split('\n')
+                substantial_chunks = [chunk.strip() for chunk in all_text_chunks 
+                                     if len(chunk.strip()) > 30 and not chunk.strip().startswith('#')]
+                
+                if len(substantial_chunks) >= expected_count:
+                    logger.info(f"✅ Fallback extracted {len(substantial_chunks)} substantial text chunks")
+                    descriptions = substantial_chunks[:expected_count]
+                else:
+                    # Last resort: Split by periods and take sentences
+                    sentences = [s.strip() + '.' for s in preprocessed_text.split('.') if len(s.strip()) > 20]
+                    if len(sentences) >= expected_count:
+                        logger.info(f"✅ Fallback extracted {len(sentences)} sentences")
+                        descriptions = sentences[:expected_count]
+            
+            # ========================================
+            # STAGE 3: CLEANUP & NORMALIZATION
+            # ========================================
+            cleaned_descriptions = []
+            for desc in descriptions:
+                # Remove any remaining markdown bold markers
+                desc = re.sub(r'\*\*([^*]+)\*\*', r'\1', desc)
+                # Remove "Description:" prefix
+                desc = re.sub(r'^Description:\s*', '', desc, flags=re.IGNORECASE)
+                # Remove leading numbers if any slipped through
+                desc = re.sub(r'^\d+\.\s+', '', desc)
+                # Remove table names if present (e.g., "schema.table - " or "schema.table: ")
+                desc = re.sub(r'^[\w\d_]+\.[\w\d_]+[\s\-:]+', '', desc)
+                cleaned_descriptions.append(desc.strip())
+            
+            descriptions = cleaned_descriptions
+            
+            # ========================================
+            # STAGE 4: FINAL SAFETY NET
+            # ========================================
+            # Only use generic fallbacks as absolute last resort
             while len(descriptions) < expected_count:
+                logger.error(f"❌ PARSING FAILED: Only {len(descriptions)}/{expected_count} descriptions extracted")
+                logger.error(f"📊 Model used: {self.config.get('model', 'unknown')}")
+                logger.error(f"📝 Response preview: {response_text[:500]}...")
                 descriptions.append(f"Description for object {len(descriptions) + 1}")
             
+            # Truncate if we have too many
             return descriptions[:expected_count]
             
         except Exception as e:
@@ -1660,36 +2105,105 @@ Generate professional descriptions for the following columns in table '{table_na
             return [f"Description for object {i+1}" for i in range(expected_count)]
     
     def _calculate_confidence_score(self, description: str, context: Dict, object_type: str, pii_analysis: Dict = None) -> float:
-        """Calculate confidence score for generated description"""
+        """
+        Calculate confidence score for generated description using fast heuristics.
+        No LLM calls - optimized for batch processing hundreds of objects.
+        
+        Score components:
+        - Lexical diversity (30%): Unique words / total words
+        - Context utilization (25%): References to actual context data
+        - Specificity (25%): Domain terms vs generic terms
+        - Structure quality (20%): Well-formed, appropriate length
+        """
         if not description or description.strip() == "":
             return 0.0
         
-        score = 0.5  # Base score
+        desc_lower = description.lower()
+        words = desc_lower.split()
         
-        # Length and detail bonus
-        if len(description) > 50:
-            score += 0.1
-        if len(description) > 100:
-            score += 0.1
+        # Component 1: Lexical Diversity (30%) - Fast unique word ratio
+        if len(words) > 0:
+            unique_ratio = len(set(words)) / len(words)
+            lexical_score = min(unique_ratio * 1.2, 1.0)  # Boost slightly, cap at 1.0
+        else:
+            lexical_score = 0.0
         
-        # Context usage bonus
+        # Component 2: Context Utilization (25%) - Did LLM use provided context?
+        context_score = 0.0
         if object_type == 'schema' and context.get('table_names'):
-            score += 0.1
+            # Check if description mentions any actual table names
+            table_names = [t.lower() for t in context.get('table_names', [])]
+            mentioned = sum(1 for t in table_names if t in desc_lower)
+            context_score = min(mentioned / max(len(table_names), 1) * 2, 1.0)
         elif object_type == 'table' and context.get('column_names'):
-            score += 0.1
+            # Check if description mentions column names or data types
+            col_names = [c.lower() for c in context.get('column_names', [])]
+            mentioned = sum(1 for c in col_names[:10] if c in desc_lower)  # Check first 10
+            context_score = min(mentioned / min(len(col_names), 5), 1.0)
         elif object_type == 'column' and context.get('sample_values'):
-            score += 0.1
+            # For columns, just check if it has samples (already used)
+            context_score = 0.8
         
-        # PII analysis bonus
+        # Component 3: Specificity (25%) - Domain-specific vs generic terms
+        domain_terms = [
+            'join', 'foreign key', 'primary key', 'index', 'aggregate', 'metric',
+            'dimension', 'fact', 'relationship', 'reference', 'lookup', 'transaction',
+            'temporal', 'snapshot', 'incremental', 'partition', 'denormalized'
+        ]
+        generic_terms = [
+            'contains', 'stores', 'holds', 'has', 'includes', 'information', 
+            'data', 'values', 'records', 'items'
+        ]
+        
+        domain_count = sum(1 for term in domain_terms if term in desc_lower)
+        generic_count = sum(1 for term in generic_terms if term in desc_lower)
+        
+        # Reward domain terms, penalize excessive generic terms
+        specificity_score = min((domain_count * 0.3) + max(0, (1 - generic_count * 0.2)), 1.0)
+        
+        # Component 4: Structure Quality (20%) - Length and sentence structure
+        char_count = len(description)
+        sentence_count = description.count('.') + description.count('!') + description.count('?')
+        
+        # Optimal length ranges (based on generation style)
+        if object_type == 'schema':
+            optimal_min, optimal_max = 100, 300
+        elif object_type == 'table':
+            optimal_min, optimal_max = 80, 250
+        else:  # column
+            optimal_min, optimal_max = 40, 150
+        
+        # Length score: Peak at optimal range, drop off outside
+        if char_count < optimal_min:
+            length_score = char_count / optimal_min
+        elif char_count <= optimal_max:
+            length_score = 1.0
+        else:
+            length_score = max(0.5, 1.0 - ((char_count - optimal_max) / optimal_max))
+        
+        # Sentence count score: 1-3 sentences is ideal
+        if sentence_count >= 1 and sentence_count <= 3:
+            sentence_score = 1.0
+        elif sentence_count == 0:
+            sentence_score = 0.3
+        else:
+            sentence_score = max(0.5, 1.0 - (sentence_count - 3) * 0.1)
+        
+        structure_score = (length_score * 0.7) + (sentence_score * 0.3)
+        
+        # Weighted combination
+        final_score = (
+            lexical_score * 0.30 +
+            context_score * 0.25 +
+            specificity_score * 0.25 +
+            structure_score * 0.20
+        )
+        
+        # Bonus: PII detected (shows thorough analysis)
         if pii_analysis and pii_analysis.get('pii_types'):
-            score += 0.1
+            final_score = min(final_score + 0.05, 1.0)
         
-        # Avoid generic descriptions penalty
-        generic_phrases = ['contains', 'stores', 'information', 'data']
-        if sum(phrase in description.lower() for phrase in generic_phrases) > 2:
-            score -= 0.1
-        
-        return min(1.0, max(0.0, score))
+        return round(final_score, 2)
     
     def _create_optimal_chunks(self, columns: List[Dict]) -> List[List[Dict]]:
         """Create optimal chunks for column processing"""
@@ -1744,9 +2258,17 @@ Generate professional descriptions for the following columns in table '{table_na
         
         Used for: Table-level description generation (fast, no data access needed)
         Limits to max_table_context_columns to prevent wide table slowdown.
+        
+        CACHED: Results are cached across models to avoid redundant queries.
         """
         try:
             full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+            cache_key = full_table_name
+            
+            # Check cache first
+            if cache_key in self.column_metadata_cache:
+                logger.debug(f"♻️ Column metadata cache hit for {full_table_name}")
+                return self.column_metadata_cache[cache_key]
             
             # Cap columns at configured limit for table context (prevents wide table slowdown)
             max_cols = self.config.get('max_table_context_columns', 50)
@@ -1779,6 +2301,9 @@ Generate professional descriptions for the following columns in table '{table_na
                 for row in columns_metadata
             ]
             
+            # Cache the result
+            self.column_metadata_cache[cache_key] = columns
+            
             if len(columns) >= max_cols:
                 logger.info(f"✅ Retrieved {len(columns)} column names for {full_table_name} (capped at {max_cols} for table context, no data sampling)")
             else:
@@ -1795,9 +2320,17 @@ Generate professional descriptions for the following columns in table '{table_na
         
         Used for: Column-level description generation (requires actual data)
         Only runs when generating column descriptions, not table descriptions.
+        
+        CACHED: Sample data is cached across models to avoid redundant table scans.
         """
         try:
             full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+            cache_key = full_table_name
+            
+            # Check cache first
+            if cache_key in self.sample_data_cache:
+                logger.debug(f"♻️ Sample data cache hit for {full_table_name}")
+                return self.sample_data_cache[cache_key]
             
             # Check if sampling is enabled
             sampling_enabled = self.config.get('enable_sampling', True)
@@ -1870,6 +2403,9 @@ Generate professional descriptions for the following columns in table '{table_na
                     'sample_values': sample_values[:10]  # Limit to 10 samples for analysis
                 })
             
+            # Cache the sample data
+            self.sample_data_cache[cache_key] = columns_with_samples
+            
             if len(columns_with_samples) >= max_cols:
                 logger.info(f"✅ Sampled {len(columns_with_samples)} columns with data from {full_table_name} (capped at {max_cols} to prevent wide table slowdown)")
             else:
@@ -1880,8 +2416,16 @@ Generate professional descriptions for the following columns in table '{table_na
             logger.error(f"❌ Error sampling data from {catalog_name}.{schema_name}.{table_name}: {e}")
             return []
     
-    async def _enrich_columns_with_samples(self, columns: List[Dict]) -> List[Dict]:
-        """Enrich column information with sample data for PII detection and context"""
+    async def _enrich_columns_with_samples(self, columns: List[Dict], table_sample_cache: Dict = None) -> List[Dict]:
+        """Enrich column information with sample data for PII detection and context
+        
+        NOTE: This is now called per-chunk (typically 10-20 columns) rather than per-table,
+        which dramatically improves performance for wide tables (100+ columns).
+        
+        Args:
+            columns: List of column dicts to enrich
+            table_sample_cache: Optional pre-cached sample data for the table to avoid re-querying
+        """
         if not columns:
             return columns
         
@@ -1898,20 +2442,32 @@ Generate professional descriptions for the following columns in table '{table_na
         table_name = first_col['table_name']
         full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
         
+        # OPTIMIZATION: Check if we have cached sample data for this table
+        if table_sample_cache is not None:
+            logger.info(f"📦 Using cached sample data for {full_table_name} (avoiding redundant query)")
+            # Enrich columns with cached sample data
+            for col in columns:
+                col_name = col['column_name']
+                if col_name in table_sample_cache:
+                    col['sample_values'] = table_sample_cache[col_name].get('sample_values', [])
+            return columns
+        
         sample_rows = self.config.get('sample_rows', 10)
         max_cols = self.config.get('max_table_context_columns', 50)
         
-        # OPTIMIZATION: Only sample the columns we need to enrich, not the entire table
+        # OPTIMIZATION: Only sample the columns in this chunk, not the entire table
         # Extract the column names we actually need to sample
         columns_to_sample = [col['column_name'] for col in columns]
         
-        # Cap at max_table_context_columns to prevent wide table slowdown
+        # Cap at max_table_context_columns to prevent edge cases with huge chunks
+        # NOTE: With per-chunk sampling, chunks are typically 10-20 columns, so this rarely triggers
+        # Columns beyond max_cols will be processed without sample data
         if len(columns_to_sample) > max_cols:
-            logger.warning(f"⚠️ Requested {len(columns_to_sample)} columns to sample, capping at {max_cols} for performance")
+            logger.warning(f"⚠️ Large chunk: {len(columns_to_sample)} columns, sampling first {max_cols} for performance (remaining {len(columns_to_sample) - max_cols} in this chunk will process without samples)")
             columns_to_sample = columns_to_sample[:max_cols]
-            columns = columns[:max_cols]  # Also truncate the input list to match
         
-        logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for {len(columns_to_sample)} columns")
+        # Typically chunks are small now, so this is very efficient
+        logger.info(f"📊 Sampling {sample_rows} rows from {full_table_name} for {len(columns_to_sample)} columns in this chunk")
         
         try:
             # Get column names in the correct order from information_schema
@@ -1964,7 +2520,7 @@ Generate professional descriptions for the following columns in table '{table_na
                 col_index = column_positions.get(column_name)
                 
                 if col_index is None:
-                    logger.warning(f"Column {column_name} not found in metadata")
+                    # Column wasn't sampled (likely beyond max_cols limit or missing)
                     enriched_columns.append(column)
                     continue
                 

@@ -1062,6 +1062,8 @@ class AutoSetupManager:
                             raise  # Re-raise to be caught by outer try-catch
                     
                     try:
+                        # Use simple INSERT for now (MERGE has alias limitations in Databricks)
+                        # TODO: Add proper deduplication logic if needed
                         sql_statement = f"""
                             INSERT INTO {results_table} (
                                 run_id, full_name, object_type, proposed_comment, confidence_score,

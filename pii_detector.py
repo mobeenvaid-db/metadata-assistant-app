@@ -1269,25 +1269,42 @@ CLASSIFICATION: [PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED, PII, PHI, PCI]"""
                 column_name = col['column_name']
                 data_type = col['data_type']
                 sample_values = col.get('sample_values', [])
+                description = col.get('description', '') or col.get('comment', '')
                 
-                sample_info = ""
+                # Build column info line
+                column_line = f"{i}. {column_name} ({data_type})"
+                
+                # Add description if available (critical for PII detection)
+                # Truncate to 150 chars to keep prompts concise while preserving key info
+                if description:
+                    desc_truncated = description[:150] + '...' if len(description) > 150 else description
+                    column_line += f"\n   Description: {desc_truncated}"
+                
+                # Add sample values if available
                 if sample_values:
                     samples = sample_values[:3]
                     sample_str = ', '.join(str(s)[:20] + '...' if len(str(s)) > 20 else str(s) for s in samples)
-                    sample_info = f" | Sample values: {sample_str}"
+                    column_line += f"\n   Sample values: {sample_str}"
                 
-                prompt += f"{i}. {column_name} ({data_type}){sample_info}\n"
+                prompt += column_line + "\n\n"
             
             prompt += f"""
 REGULATORY FRAMEWORKS:
-- PII (GDPR/CCPA): Personal identifiers (name, email, SSN, phone, address, DOB)
+- PII (GDPR/CCPA): Personal identifiers including:
+  * Names (first name, last name, full name, surname, family name, given name)
+  * Contact info (email, phone, address, postal code)
+  * Identifiers (SSN, passport, license, employee ID)
+  * Demographics (DOB, age, gender, ethnicity)
 - PHI (HIPAA): Health data (diagnoses, prescriptions, patient IDs, medical records)
 - PCI (PCI-DSS): Payment data (credit cards, bank accounts, CVV, transactions)
 - FINANCIAL (SOX/GLBA): Banking/trading data (balances, account numbers, trades)
 - BIOMETRIC: Fingerprints, facial recognition, DNA
 - CONFIDENTIAL: Trade secrets, proprietary data
 
+CRITICAL: Any column containing INDIVIDUAL NAMES (including first names, last names, surnames, or full names) MUST be classified as PII.
+
 For EACH column, classify based on regulatory exposure if breached. Consider:
+- Column description (most important - tells you what data the column actually contains)
 - Column name patterns and business context
 - Sample values and data patterns
 - Data type appropriateness for sensitive data
@@ -1295,6 +1312,16 @@ For EACH column, classify based on regulatory exposure if breached. Consider:
 Respond with EXACTLY {len(columns)} lines in this format (one per column):
 PII_TYPES: [types like "email", "ssn", "credit_card", "diagnosis", "account_balance" or "none"] | CONFIDENCE: [0.0-1.0] | CLASSIFICATION: [PUBLIC/INTERNAL/PII/PHI/PCI]
 """
+            
+            # Log prompt summary with description count
+            cols_with_descriptions = sum(1 for col in columns if col.get('description') or col.get('comment'))
+            logger.info(f"🔒 Batch LLM PII Detection: {len(columns)} columns, {cols_with_descriptions} have descriptions")
+            
+            # Log sample column info for debugging (first column only)
+            if columns and (columns[0].get('description') or columns[0].get('comment')):
+                sample_col = columns[0]
+                sample_desc = (sample_col.get('description') or sample_col.get('comment', ''))[:100]
+                logger.info(f"🔍 Sample column for PII: {sample_col['column_name']} - \"{sample_desc}...\"")
             
             logger.info(f"🔒 Batch LLM Regulatory Detection Prompt (first 300 chars):\n{prompt[:300]}...")
             logger.info(f"Calling LLM with prompt length: {len(prompt)}")
