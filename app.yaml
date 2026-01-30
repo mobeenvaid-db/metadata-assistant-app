@@ -8,7 +8,7 @@ command: [
 
 env:
   - name: 'DATABRICKS_HTTP_PATH'
-    value: '/sql/1.0/warehouses/fc63b669d98bde08'
+    value: '<Your Warehouse HTTP Path>'
   - name: 'DATABRICKS_SERVER_HOSTNAME'
-    value: 'fe-vm-mv-serverless-tixx4d.cloud.databricks.com'
+    value: '<Your Server Hostname>'
 
