@@ -1664,7 +1664,7 @@ def api_enhanced_run():
                 """Generate metadata for a single model"""
                 try:
                     logger.info(f"🎯 Model {model_idx}/{total_models} ({model_name}) starting...")
-                    
+                
                     # Create model-specific enhanced_generator to avoid progress conflicts
                     from enhanced_generator import EnhancedMetadataGenerator
                     model_generator = EnhancedMetadataGenerator(llm_service, unity_service, settings_manager)
@@ -2452,6 +2452,127 @@ def api_quality_confidence(catalog_name):
         return jsonify({'distribution': []})
 
 
+@flask_app.route("/api/metadata-history/<catalog_name>/cleanup", methods=['POST'])
+def api_cleanup_history(catalog_name):
+    """Cleanup old history records"""
+    try:
+        from flask import request
+        data = request.get_json()
+        option = data.get('option', '6months')
+        
+        logger.info(f"🗑️  Starting history cleanup for {catalog_name} with option: {option}")
+        
+        setup_manager = get_setup_manager()
+        config = setup_manager.default_config
+        results_table = f"{config['output_catalog']}.{config['output_schema']}.{config['results_table']}"
+        
+        # Build DELETE query based on cleanup option
+        if option == '6months':
+            delete_sql = f"""
+                DELETE FROM {results_table}
+                WHERE full_name LIKE '{catalog_name}.%'
+                AND generated_at < current_timestamp() - INTERVAL 6 MONTHS
+            """
+            description = "records older than 6 months"
+        elif option == '1year':
+            delete_sql = f"""
+                DELETE FROM {results_table}
+                WHERE full_name LIKE '{catalog_name}.%'
+                AND generated_at < current_timestamp() - INTERVAL 1 YEAR
+            """
+            description = "records older than 1 year"
+        elif option == '1000records':
+            # Keep only the most recent 1000 records
+            # First, get the cutoff timestamp
+            delete_sql = f"""
+                DELETE FROM {results_table}
+                WHERE full_name LIKE '{catalog_name}.%'
+                AND generated_at < (
+                    SELECT MIN(generated_at) FROM (
+                        SELECT generated_at
+                        FROM {results_table}
+                        WHERE full_name LIKE '{catalog_name}.%'
+                        ORDER BY generated_at DESC
+                        LIMIT 1000
+                    ) AS recent_1000
+                )
+            """
+            description = "all but the most recent 1,000 records"
+        elif option == '5000records':
+            # Keep only the most recent 5000 records
+            # First, get the cutoff timestamp
+            delete_sql = f"""
+                DELETE FROM {results_table}
+                WHERE full_name LIKE '{catalog_name}.%'
+                AND generated_at < (
+                    SELECT MIN(generated_at) FROM (
+                        SELECT generated_at
+                        FROM {results_table}
+                        WHERE full_name LIKE '{catalog_name}.%'
+                        ORDER BY generated_at DESC
+                        LIMIT 5000
+                    ) AS recent_5000
+                )
+            """
+            description = "all but the most recent 5,000 records"
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid cleanup option'
+            }), 400
+        
+        # Get count BEFORE deletion
+        count_before_sql = f"SELECT COUNT(*) FROM {results_table} WHERE full_name LIKE '{catalog_name}.%'"
+        count_before_future = run_async_in_thread(setup_manager._execute_sql(count_before_sql))
+        count_before_result = count_before_future.result(timeout=30)
+        
+        before_count = 0
+        if count_before_result.get('success') and count_before_result.get('data'):
+            before_count = int(count_before_result['data'][0][0]) if count_before_result['data'] else 0
+        
+        logger.info(f"🗑️  Records before cleanup: {before_count}")
+        
+        # Execute DELETE
+        logger.info(f"🗑️  Executing cleanup: {description}")
+        logger.info(f"🗑️  SQL: {delete_sql}")
+        future = run_async_in_thread(setup_manager._execute_sql(delete_sql))
+        result = future.result(timeout=60)
+        
+        if result.get('success'):
+            # Get count AFTER deletion
+            count_after_sql = f"SELECT COUNT(*) FROM {results_table} WHERE full_name LIKE '{catalog_name}.%'"
+            count_after_future = run_async_in_thread(setup_manager._execute_sql(count_after_sql))
+            count_after_result = count_after_future.result(timeout=30)
+            
+            after_count = 0
+            if count_after_result.get('success') and count_after_result.get('data'):
+                after_count = int(count_after_result['data'][0][0]) if count_after_result['data'] else 0
+            
+            deleted_count = before_count - after_count
+            
+            logger.info(f"✅ History cleanup complete. Before: {before_count}, After: {after_count}, Deleted: {deleted_count}")
+            
+            return jsonify({
+                'success': True,
+                'message': f'Successfully deleted {description}',
+                'deleted_count': deleted_count,
+                'remaining_count': after_count
+            })
+        else:
+            logger.error(f"❌ History cleanup failed: {result.get('error')}")
+            return jsonify({
+                'success': False,
+                'message': f"Cleanup failed: {result.get('error', 'Unknown error')}"
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Error cleaning up history: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'message': str(e)
+        }), 500
+
+
 @flask_app.route("/api/metadata-history/<catalog_name>")
 def api_metadata_history(catalog_name):
     """Get metadata update history for a catalog"""
@@ -2468,7 +2589,16 @@ def api_metadata_history(catalog_name):
         filter_object_type = request.args.get('object_type', '')
         filter_data_object = request.args.get('data_object', '')
         
-        logger.info(f"📜 Fetching metadata history for {catalog_name} (last {days} days)")
+        # Pagination parameters
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 50))
+        
+        # Validate pagination params
+        page = max(1, page)  # Minimum page 1
+        page_size = min(max(10, page_size), 2000)  # Between 10 and 2000 (allow loading all for small datasets)
+        offset = (page - 1) * page_size
+        
+        logger.info(f"📜 Fetching metadata history for {catalog_name} (last {days} days, page {page}, size {page_size})")
         
         # Query the metadata_results table for history
         config = setup_manager.default_config
@@ -2494,9 +2624,14 @@ def api_metadata_history(catalog_name):
         
         where_clause = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
         
-        # Query for history records (matching original app.py structure)
-        # NOTE: No LIMIT here - let frontend handle pagination of full dataset
-        # If performance becomes an issue with large datasets, implement server-side pagination
+        # First, get the total count
+        count_query = f"""
+            SELECT COUNT(*) as total
+            FROM {results_table}
+            {where_clause}
+        """
+        
+        # Then get the paginated results
         query = f"""
             SELECT 
                 generated_at as date,
@@ -2508,12 +2643,38 @@ def api_metadata_history(catalog_name):
             FROM {results_table}
             {where_clause}
             ORDER BY generated_at DESC
+            LIMIT {page_size}
+            OFFSET {offset}
         """
         
-        logger.info(f"📜 Executing history query on {results_table}")
+        logger.info(f"📜 Executing count and paginated history queries on {results_table}")
         
         try:
-            # Execute query using setup_manager (same as review endpoint)
+            # First, get the total count
+            count_future = run_async_in_thread(setup_manager._execute_sql(count_query))
+            count_result = count_future.result(timeout=30)
+            
+            total_count = 0
+            if count_result.get('success') and count_result.get('data'):
+                # data is an array of arrays: [[count_value]]
+                count_value = count_result['data'][0][0] if count_result['data'] and len(count_result['data'][0]) > 0 else 0
+                # SQL results may come back as strings, ensure it's an int
+                total_count = int(count_value) if count_value else 0
+            
+            logger.info(f"📊 Total matching records: {total_count}")
+            
+            # If no records, return early
+            if total_count == 0:
+                return jsonify({
+                    'history': [],
+                    'total': 0,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': 0,
+                    'message': 'No history available yet. Generate some metadata first!'
+                })
+            
+            # Execute paginated query
             future = run_async_in_thread(setup_manager._execute_sql(query))
             result = future.result(timeout=30)
         except Exception as query_error:
@@ -2522,13 +2683,16 @@ def api_metadata_history(catalog_name):
             return jsonify({
                 'history': [],
                 'total': 0,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': 0,
                 'message': 'No history available yet. Generate some metadata first!'
             })
         
         history_records = []
         if result.get('success') and result.get('data'):
-            total_rows = len(result.get('data', []))
-            logger.info(f"📊 Retrieved {total_rows} history records from database")
+            page_rows = len(result.get('data', []))
+            logger.info(f"📊 Retrieved {page_rows} history records for page {page} (total: {total_count})")
             
             for row in result.get('data', []):
                 if len(row) >= 6:
@@ -2566,11 +2730,19 @@ def api_metadata_history(catalog_name):
                         'model': source_model
                     })
         
-        logger.info(f"📊 Found {len(history_records)} history records")
+        logger.info(f"📊 Found {len(history_records)} history records on page {page}")
+        
+        # Calculate total pages
+        total_pages = (total_count + page_size - 1) // page_size  # Ceiling division
         
         return jsonify({
             'history': history_records,
-            'total': len(history_records)
+            'total': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'has_next': page < total_pages,
+            'has_prev': page > 1
         })
         
     except Exception as e:
@@ -2579,6 +2751,11 @@ def api_metadata_history(catalog_name):
         return jsonify({
             'history': [],
             'total': 0,
+            'page': 1,
+            'page_size': 50,
+            'total_pages': 0,
+            'has_next': False,
+            'has_prev': False,
             'message': 'Unable to load history. The metadata tracking table may not be set up yet.'
         })
 
