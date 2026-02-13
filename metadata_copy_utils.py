@@ -917,66 +917,119 @@ class MetadataCopyUtils:
             'errors': errors
         }
     
+    def _get_tags_for_export(self, catalog_name: str, schema_names: Optional[List[str]] = None,
+                             table_names: Optional[List[str]] = None,
+                             column_names: Optional[List[str]] = None) -> Dict[str, List[Tuple[str, str]]]:
+        """
+        Fetch tags for schemas, tables, and columns in the catalog.
+        Returns dict: full_name -> [(tag_key, tag_value), ...]
+        """
+        from collections import defaultdict
+        result = defaultdict(list)
+        catalog_escaped = catalog_name.replace("'", "''")
+        try:
+            # Schema tags
+            schema_tags_sql = f"""
+                SELECT CONCAT(catalog_name, '.', schema_name) AS full_name, tag_name, tag_value
+                FROM system.information_schema.schema_tags
+                WHERE catalog_name = '{catalog_escaped}'
+            """
+            if schema_names:
+                schemas_list = "', '".join(s.replace("'", "''") for s in schema_names)
+                schema_tags_sql += f" AND schema_name IN ('{schemas_list}')"
+            rows = self.unity_service._execute_sql_warehouse(schema_tags_sql)
+            for row in (rows or []):
+                if len(row) >= 3 and row[0] and row[1]:
+                    result[row[0]].append((row[1], (row[2] or '')))
+
+            # Table tags
+            table_tags_sql = f"""
+                SELECT CONCAT(catalog_name, '.', schema_name, '.', table_name) AS full_name, tag_name, tag_value
+                FROM system.information_schema.table_tags
+                WHERE catalog_name = '{catalog_escaped}'
+            """
+            if schema_names:
+                schemas_list = "', '".join(s.replace("'", "''") for s in schema_names)
+                table_tags_sql += f" AND schema_name IN ('{schemas_list}')"
+            if table_names:
+                table_tags_sql += f" AND CONCAT(catalog_name, '.', schema_name, '.', table_name) IN ({','.join(repr(t) for t in table_names)})"
+            rows = self.unity_service._execute_sql_warehouse(table_tags_sql)
+            for row in (rows or []):
+                if len(row) >= 3 and row[0] and row[1]:
+                    result[row[0]].append((row[1], (row[2] or '')))
+
+            # Column tags (system.information_schema.column_tags; may not exist on older runtimes)
+            try:
+                col_tags_sql = f"""
+                    SELECT CONCAT(catalog_name, '.', schema_name, '.', table_name, '.', column_name) AS full_name, tag_name, tag_value
+                    FROM system.information_schema.column_tags
+                    WHERE catalog_name = '{catalog_escaped}'
+                """
+                if schema_names:
+                    schemas_list = "', '".join(s.replace("'", "''") for s in schema_names)
+                    col_tags_sql += f" AND schema_name IN ('{schemas_list}')"
+                if column_names:
+                    col_tags_sql += f" AND CONCAT(catalog_name, '.', schema_name, '.', table_name, '.', column_name) IN ({','.join(repr(c) for c in column_names)})"
+                rows = self.unity_service._execute_sql_warehouse(col_tags_sql)
+                for row in (rows or []):
+                    if len(row) >= 3 and row[0] and row[1]:
+                        result[row[0]].append((row[1], (row[2] or '')))
+            except Exception as col_tag_err:
+                logger.debug(f"Column tags not available (e.g. older runtime): {col_tag_err}")
+        except Exception as e:
+            logger.warning(f"Error fetching tags for export: {e}")
+        return dict(result)
+
     def export_metadata_csv(self, catalog_name: str, schema_names: Optional[List[str]] = None,
                            table_names: Optional[List[str]] = None, column_names: Optional[List[str]] = None,
                            include_tags: bool = False) -> str:
         """
-        Export metadata to CSV format
-        
-        Args:
-            catalog_name: Catalog to export from
-            schema_names: Optional list of specific schemas
-            table_names: Optional list of specific tables (full names)
-            column_names: Optional list of specific columns (full names)
-            include_tags: Whether to include tags in export (future enhancement)
-        
-        Returns:
-            CSV string
+        Export metadata to CSV format.
+        When include_tags is True, uses import format: full_name, object_type, description, tag_key, tag_value.
+        Objects with multiple tags get one row per tag; objects with no tags get one row with empty tag_key/tag_value.
         """
         output = io.StringIO()
         writer = csv.writer(output)
-        
-        # Write header
         if include_tags:
-            writer.writerow(['full_name', 'object_type', 'description', 'tags', 'pii_classification', 'confidence_score'])
+            writer.writerow(['full_name', 'object_type', 'description', 'tag_key', 'tag_value'])
         else:
             writer.writerow(['full_name', 'object_type', 'description'])
-        
+
         try:
-            # Get objects with descriptions
             objects = self.get_objects_with_descriptions(catalog_name)
-            
-            # Export schemas
+            tags_by_full_name = self._get_tags_for_export(catalog_name, schema_names, table_names, column_names) if include_tags else {}
+
+            def write_rows(full_name: str, object_type: str, description: str):
+                desc_escaped = (description or '').replace('"', '""')
+                if not include_tags:
+                    writer.writerow([full_name, object_type, desc_escaped])
+                    return
+                tag_list = tags_by_full_name.get(full_name, [])
+                if not tag_list:
+                    writer.writerow([full_name, object_type, desc_escaped, '', ''])
+                else:
+                    for tag_key, tag_value in tag_list:
+                        v_escaped = (tag_value or '').replace('"', '""')
+                        writer.writerow([full_name, object_type, desc_escaped, tag_key or '', v_escaped])
+
             for schema in objects['schemas']:
                 if schema_names and schema['full_name'].split('.')[1] not in schema_names:
                     continue
-                if include_tags:
-                    writer.writerow([schema['full_name'], 'schema', schema['description'], '', '', ''])
-                else:
-                    writer.writerow([schema['full_name'], 'schema', schema['description']])
-            
-            # Export tables
+                write_rows(schema['full_name'], 'schema', schema.get('description', ''))
+
             for table in objects['tables']:
                 if table_names and table['full_name'] not in table_names:
                     continue
-                if include_tags:
-                    writer.writerow([table['full_name'], 'table', table['description'], '', '', ''])
-                else:
-                    writer.writerow([table['full_name'], 'table', table['description']])
-            
-            # Export columns
+                write_rows(table['full_name'], 'table', table.get('description', ''))
+
             for column in objects['columns']:
                 if column_names and column['full_name'] not in column_names:
                     continue
-                if include_tags:
-                    writer.writerow([column['full_name'], 'column', column['description'], '', '', ''])
-                else:
-                    writer.writerow([column['full_name'], 'column', column['description']])
-            
+                write_rows(column['full_name'], 'column', column.get('description', ''))
+
             csv_content = output.getvalue()
-            logger.info(f"📤 Exported {len(objects['schemas'])} schemas, {len(objects['tables'])} tables, {len(objects['columns'])} columns to CSV")
+            logger.info(f"📤 Exported {len(objects['schemas'])} schemas, {len(objects['tables'])} tables, {len(objects['columns'])} columns to CSV" + (" (with tags)" if include_tags else ""))
             return csv_content
-            
         except Exception as e:
             logger.error(f"Error exporting metadata to CSV: {e}")
             raise
@@ -1149,8 +1202,18 @@ class MetadataCopyUtils:
                 
                 schema = tag_schemas.get(tag_key, {})
                 
-                if schema.get('is_governed'):
-                    # Governed tag - validate value against allowed_values
+                if schema.get('exists') is False:
+                    # Tag will be created
+                    results.append({
+                        'tag_key': tag_key,
+                        'tag_value': tag_value,
+                        'object_name': object_name,
+                        'is_valid': True,
+                        'validation_message': f'Tag "{tag_key}" will be created'
+                    })
+                    valid_count += 1
+                elif schema.get('is_governed'):
+                    # Check if value is allowed
                     allowed = schema['allowed_values']
                     if tag_value in allowed:
                         results.append({
@@ -1158,7 +1221,7 @@ class MetadataCopyUtils:
                             'tag_value': tag_value,
                             'object_name': object_name,
                             'is_valid': True,
-                            'validation_message': f'✓ Valid governed tag value'
+                            'validation_message': f'Valid governed tag'
                         })
                         valid_count += 1
                     else:
@@ -1167,17 +1230,17 @@ class MetadataCopyUtils:
                             'tag_value': tag_value,
                             'object_name': object_name,
                             'is_valid': False,
-                            'validation_message': f'Invalid value "{tag_value}" for governed tag "{tag_key}". Allowed values: {", ".join(allowed)}'
+                            'validation_message': f'Invalid value "{tag_value}" for governed tag "{tag_key}". Allowed: {", ".join(allowed)}'
                         })
                         invalid_count += 1
                 else:
-                    # Not a governed tag - allow any value
+                    # Tag exists but not governed
                     results.append({
                         'tag_key': tag_key,
                         'tag_value': tag_value,
                         'object_name': object_name,
                         'is_valid': True,
-                        'validation_message': '✓ Valid tag (not governed)'
+                        'validation_message': 'Valid tag'
                     })
                     valid_count += 1
             
@@ -1411,8 +1474,9 @@ class MetadataCopyUtils:
                                     if schema_name and table_name and column_name:
                                         query = f"DESCRIBE TABLE {catalog_from_csv}.{schema_name}.{table_name}"
                                         result = self.unity_service._execute_sql_warehouse(query)
-                                        # Check if column exists in the table
-                                        column_exists = any(row[0] == column_name for row in result['data'])
+                                        # _execute_sql_warehouse returns a list of rows (list of lists); DESCRIBE first column is column name
+                                        rows = result if isinstance(result, list) else []
+                                        column_exists = any((row[0] == column_name) for row in rows if row and len(row) > 0)
                                         if column_exists:
                                             exists_in_catalog = True
                                             validation_message = 'Object found - ready to import'
