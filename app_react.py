@@ -3539,10 +3539,21 @@ def api_generate_improvements():
         
         data = request.get_json()
         objects = data.get('objects', [])  # List of {full_name, object_type, current_description}
-        model_id = data.get('model_id')  # Optional model selection
+        model_id = data.get('model_id')  # Optional single model (legacy)
+        model_ids = data.get('model_ids')  # Optional list for multi-model comparison
         
         if not objects:
             return jsonify({"error": "objects is required"}), 400
+        
+        # Resolve model list: multi-model (model_ids) or single (model_id)
+        if model_ids and isinstance(model_ids, list) and len(model_ids) > 0:
+            model_list = list(model_ids)
+            multi_model = len(model_list) > 1
+        else:
+            model_list = [model_id] if model_id else []
+            multi_model = False
+        if not model_list:
+            model_list = ['databricks-gpt-oss-20b']
         
         # Create a run ID for this improvement job
         run_id = str(uuid.uuid4())
@@ -3569,212 +3580,322 @@ def api_generate_improvements():
         
         # Process in background
         async def generate_improvements_async():
+            import asyncio
             try:
-                logger.info(f"🚀 Starting improvement generation for run {run_id}")
+                logger.info(f"🚀 Starting improvement generation for run {run_id}" + (f" (multi-model: {len(model_list)} models)" if multi_model else ""))
                 improvements = []
                 
                 # Group by type for batch processing
                 schemas = [o for o in objects if o['object_type'] == 'schema']
                 tables = [o for o in objects if o['object_type'] == 'table']
                 columns = [o for o in objects if o['object_type'] == 'column']
+                base_total = len(schemas) + len(tables) + len(columns)
                 
                 logger.info(f"📋 Processing {len(schemas)} schemas, {len(tables)} tables, {len(columns)} columns")
                 
-                # Track progress
-                total_objects = len(schemas) + len(tables) + len(columns)
-                processed = 0
+                # Track progress (for multi-model: total = base_total * num_models)
+                total_objects = base_total * len(model_list) if multi_model else base_total
+                processed_ref = {'count': 0}
                 
-                # Helper to update progress
                 def update_progress(current_object=''):
-                    nonlocal processed
-                    processed += 1
+                    processed_ref['count'] += 1
                     if hasattr(flask_app, 'improvement_status') and run_id in flask_app.improvement_status:
                         flask_app.improvement_status[run_id].update({
-                            'processed': processed,
+                            'processed': processed_ref['count'],
                             'total': total_objects,
                             'current_object': current_object
                         })
                 
-                # Check for cancellation flag
                 def is_cancelled():
                     if not hasattr(flask_app, 'improvement_cancellations'):
                         return False
                     return run_id in flask_app.improvement_cancellations
                 
-                # Get model from parameter or settings
-                if model_id:
-                    model = model_id
-                    logger.info(f"Using user-selected model: {model}")
-                elif settings_mgr:
-                    models_config_data = settings_mgr.get_models_config()
-                    model = models_config_data.get('default_model', 'databricks-gpt-oss-20b')
-                    logger.info(f"Using default model from settings: {model}")
-                else:
-                    model = 'databricks-gpt-oss-20b'
-                    logger.info(f"Using fallback model: {model}")
-                
-                # Generate for schemas
-                for schema_obj in schemas:
-                    if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
-                        flask_app.improvement_status[run_id] = {
-                            'status': 'cancelled',
-                            'improvements': improvements,
-                            'total': len(improvements),
-                            'message': 'Cancelled by user'
-                        }
-                        return
+                async def run_single_model(model_name):
+                    """Run full improvement generation for one model; return list with source_model set."""
+                    model_improvements = []
+                    for schema_obj in schemas:
+                        if is_cancelled():
+                            return model_improvements
+                        parts = schema_obj['full_name'].split('.')
+                        if len(parts) >= 2:
+                            catalog, schema_name = parts[0], parts[1]
+                            schema_info = {
+                                'name': schema_name,
+                                'full_name': schema_obj['full_name'],
+                                'catalog_name': catalog,
+                                'comment': schema_obj['current_description'],
+                                'owner': ''
+                            }
+                            result = await enhanced_gen._generate_schema_metadata_enhanced(
+                                schema_info, catalog, model_name, run_id
+                            )
+                            model_improvements.append({
+                                'full_name': schema_obj['full_name'],
+                                'object_type': 'schema',
+                                'current_description': schema_obj['current_description'],
+                                'new_description': result.get('proposed_comment', ''),
+                                'confidence': result.get('confidence_score', 0.0),
+                                'source_model': model_name
+                            })
+                            update_progress(schema_obj['full_name'])
                     
-                    logger.info(f"🔄 Generating for schema: {schema_obj['full_name']}")
-                    parts = schema_obj['full_name'].split('.')
-                    if len(parts) >= 2:
-                        catalog, schema_name = parts[0], parts[1]
-                        # Build schema_info dict with expected structure
-                        schema_info = {
-                            'name': schema_name,
-                            'full_name': schema_obj['full_name'],
-                            'catalog_name': catalog,
-                            'comment': schema_obj['current_description'],
-                            'owner': ''
-                        }
-                        result = await enhanced_gen._generate_schema_metadata_enhanced(
-                            schema_info, catalog, model, run_id
-                        )
-                        improvements.append({
-                            'full_name': schema_obj['full_name'],
-                            'object_type': 'schema',
-                            'current_description': schema_obj['current_description'],
-                            'new_description': result.get('proposed_comment', ''),
-                            'confidence': result.get('confidence_score', 0.0)
-                        })
-                        update_progress(schema_obj['full_name'])
-                
-                # Generate for tables (batch by catalog)
-                tables_by_catalog = {}
-                for table_obj in tables:
-                    parts = table_obj['full_name'].split('.')
-                    if len(parts) >= 3:
-                        catalog = parts[0]
-                        if catalog not in tables_by_catalog:
-                            tables_by_catalog[catalog] = []
-                        tables_by_catalog[catalog].append(table_obj)
-                
-                for catalog, catalog_tables in tables_by_catalog.items():
-                    if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
-                        flask_app.improvement_status[run_id] = {
-                            'status': 'cancelled',
-                            'improvements': improvements,
-                            'total': len(improvements),
-                            'message': 'Cancelled by user'
-                        }
-                        return
-                    
-                    logger.info(f"🔄 Generating for {len(catalog_tables)} tables in catalog {catalog}")
-                    
-                    # Build table dicts with expected structure
-                    table_dicts = []
-                    for table_obj in catalog_tables:
+                    tables_by_catalog = {}
+                    for table_obj in tables:
                         parts = table_obj['full_name'].split('.')
-                        catalog_name, schema_name, table_name = parts[0], parts[1], parts[2]
-                        table_dicts.append({
-                            'name': table_name,
-                            'full_name': table_obj['full_name'],
-                            'catalog_name': catalog_name,
-                            'schema_name': schema_name,
-                            'table_name': table_name,
-                            'table_type': 'TABLE',
-                            'comment': table_obj['current_description'],
-                            'owner': ''
-                        })
+                        if len(parts) >= 3:
+                            catalog = parts[0]
+                            if catalog not in tables_by_catalog:
+                                tables_by_catalog[catalog] = []
+                            tables_by_catalog[catalog].append(table_obj)
                     
-                    results = await enhanced_gen._generate_tables_batch(
-                        table_dicts, catalog, model, run_id
-                    )
-                    
-                    for i, table_obj in enumerate(catalog_tables):
-                        if i < len(results):
-                            improvements.append({
-                                'full_name': table_obj['full_name'],
-                                'object_type': 'table',
-                                'current_description': table_obj['current_description'],
-                                'new_description': results[i].get('proposed_comment', ''),
-                                'confidence': results[i].get('confidence_score', 0.0)
+                    for catalog, catalog_tables in tables_by_catalog.items():
+                        if is_cancelled():
+                            return model_improvements
+                        table_dicts = []
+                        for table_obj in catalog_tables:
+                            parts = table_obj['full_name'].split('.')
+                            catalog_name, schema_name, table_name = parts[0], parts[1], parts[2]
+                            table_dicts.append({
+                                'name': table_name, 'full_name': table_obj['full_name'],
+                                'catalog_name': catalog_name, 'schema_name': schema_name,
+                                'table_name': table_name, 'table_type': 'TABLE',
+                                'comment': table_obj['current_description'], 'owner': ''
                             })
-                            update_progress(table_obj['full_name'])
+                        results = await enhanced_gen._generate_tables_batch(
+                            table_dicts, catalog, model_name, run_id
+                        )
+                        for i, table_obj in enumerate(catalog_tables):
+                            if i < len(results):
+                                model_improvements.append({
+                                    'full_name': table_obj['full_name'], 'object_type': 'table',
+                                    'current_description': table_obj['current_description'],
+                                    'new_description': results[i].get('proposed_comment', ''),
+                                    'confidence': results[i].get('confidence_score', 0.0),
+                                    'source_model': model_name
+                                })
+                                update_progress(table_obj['full_name'])
+                    
+                    columns_by_table = {}
+                    for col_obj in columns:
+                        parts = col_obj['full_name'].split('.')
+                        if len(parts) >= 4:
+                            table_key = '.'.join(parts[:3])
+                            if table_key not in columns_by_table:
+                                columns_by_table[table_key] = []
+                            columns_by_table[table_key].append(col_obj)
+                    
+                    for table_key, table_columns in columns_by_table.items():
+                        if is_cancelled():
+                            return model_improvements
+                        parts = table_key.split('.')
+                        catalog, schema, table = parts[0], parts[1], parts[2]
+                        column_metadata = await enhanced_gen._get_table_columns_with_samples(
+                            catalog, schema, table
+                        )
+                        table_sample_cache = {col['name']: col for col in column_metadata}
+                        column_dicts = []
+                        for col_obj in table_columns:
+                            column_name = col_obj['full_name'].split('.')[3]
+                            col_meta = next((c for c in column_metadata if c['name'] == column_name), {})
+                            column_dicts.append({
+                                'name': column_name, 'full_name': col_obj['full_name'],
+                                'catalog_name': catalog, 'schema_name': schema, 'table_name': table,
+                                'column_name': column_name, 'data_type': col_meta.get('data_type', ''),
+                                'is_nullable': '', 'column_default': '', 'comment': col_obj['current_description'],
+                                'sample_values': col_meta.get('sample_values', [])
+                            })
+                        result = await enhanced_gen._generate_column_chunk_metadata(
+                            column_dicts, model_name, run_id, is_improvement=True, table_sample_cache=table_sample_cache
+                        )
+                        metadata_list = result.get('metadata', [])
+                        for i, col_obj in enumerate(table_columns):
+                            if i < len(metadata_list):
+                                model_improvements.append({
+                                    'full_name': col_obj['full_name'], 'object_type': 'column',
+                                    'current_description': col_obj['current_description'],
+                                    'new_description': metadata_list[i].get('proposed_comment', ''),
+                                    'confidence': metadata_list[i].get('confidence_score', 0.0),
+                                    'source_model': model_name
+                                })
+                                update_progress(col_obj['full_name'])
+                    return model_improvements
                 
-                # Generate for columns (batch by table)
-                columns_by_table = {}
-                for col_obj in columns:
-                    parts = col_obj['full_name'].split('.')
-                    if len(parts) >= 4:
-                        table_key = '.'.join(parts[:3])  # catalog.schema.table
-                        if table_key not in columns_by_table:
-                            columns_by_table[table_key] = []
-                        columns_by_table[table_key].append(col_obj)
+                if multi_model:
+                    logger.info(f"🔄 Running {len(model_list)} models in parallel: {', '.join(model_list)}")
+                    results_per_model = await asyncio.gather(*[run_single_model(m) for m in model_list])
+                    for lst in results_per_model:
+                        improvements.extend(lst)
+                    logger.info(f"✅ Multi-model complete: {len(improvements)} total improvements")
+                else:
+                    model = model_list[0]
+                    logger.info(f"Using model: {model}")
                 
-                for table_key, table_columns in columns_by_table.items():
-                    if is_cancelled():
-                        logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
-                        flask_app.improvement_status[run_id] = {
-                            'status': 'cancelled',
-                            'improvements': improvements,
-                            'total': len(improvements),
-                            'message': 'Cancelled by user'
-                        }
-                        return
-                    
-                    parts = table_key.split('.')
-                    catalog, schema, table = parts[0], parts[1], parts[2]
-                    logger.info(f"🔄 Generating for {len(table_columns)} columns in table {table_key}")
-                    
-                    # OPTIMIZATION: Get column metadata with sample data ONCE for the entire table
-                    column_metadata = await enhanced_gen._get_table_columns_with_samples(
-                        catalog, schema, table
-                    )
-                    
-                    # Convert to a cache dict for fast lookup by column name
-                    table_sample_cache = {col['name']: col for col in column_metadata}
-                    logger.info(f"📦 Cached sample data for {len(table_sample_cache)} columns in {table_key}")
-                    
-                    # Build column dicts with expected structure including sample data
-                    column_dicts = []
-                    for col_obj in table_columns:
-                        column_name = col_obj['full_name'].split('.')[3]
-                        # Find matching metadata (note: _get_table_columns_with_samples uses 'name' key, not 'column_name')
-                        col_meta = next((c for c in column_metadata if c['name'] == column_name), {})
+                    # Generate for schemas (single-model path only)
+                    for schema_obj in schemas:
+                        if is_cancelled():
+                            logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                            flask_app.improvement_status[run_id] = {
+                                'status': 'cancelled',
+                                'improvements': improvements,
+                                'total': len(improvements),
+                                'message': 'Cancelled by user'
+                            }
+                            return
                         
-                        column_dicts.append({
-                            'name': column_name,
-                            'full_name': col_obj['full_name'],
-                            'catalog_name': catalog,
-                            'schema_name': schema,
-                            'table_name': table,
-                            'column_name': column_name,
-                            'data_type': col_meta.get('data_type', ''),
-                            'is_nullable': '',  # Not returned by _get_table_columns_with_samples
-                            'column_default': '',  # Not returned by _get_table_columns_with_samples
-                            'comment': col_obj['current_description'],
-                            'sample_values': col_meta.get('sample_values', [])  # Include samples for context!
-                        })
-                    
-                    # Pass the cache to avoid redundant sampling queries
-                    result = await enhanced_gen._generate_column_chunk_metadata(
-                        column_dicts, model, run_id, is_improvement=True, table_sample_cache=table_sample_cache
-                    )
-                    
-                    # _generate_column_chunk_metadata returns a dict with 'metadata' key containing list of results
-                    metadata_list = result.get('metadata', [])
-                    for i, col_obj in enumerate(table_columns):
-                        if i < len(metadata_list):
+                        logger.info(f"🔄 Generating for schema: {schema_obj['full_name']}")
+                        parts = schema_obj['full_name'].split('.')
+                        if len(parts) >= 2:
+                            catalog, schema_name = parts[0], parts[1]
+                            # Build schema_info dict with expected structure
+                            schema_info = {
+                                'name': schema_name,
+                                'full_name': schema_obj['full_name'],
+                                'catalog_name': catalog,
+                                'comment': schema_obj['current_description'],
+                                'owner': ''
+                            }
+                            result = await enhanced_gen._generate_schema_metadata_enhanced(
+                                schema_info, catalog, model, run_id
+                            )
                             improvements.append({
-                                'full_name': col_obj['full_name'],
-                                'object_type': 'column',
-                                'current_description': col_obj['current_description'],
-                                'new_description': metadata_list[i].get('proposed_comment', ''),
-                                'confidence': metadata_list[i].get('confidence_score', 0.0)
+                                'full_name': schema_obj['full_name'],
+                                'object_type': 'schema',
+                                'current_description': schema_obj['current_description'],
+                                'new_description': result.get('proposed_comment', ''),
+                                'confidence': result.get('confidence_score', 0.0),
+                                'source_model': model
                             })
-                            update_progress(col_obj['full_name'])
+                            update_progress(schema_obj['full_name'])
+                
+                    # Generate for tables (batch by catalog)
+                    tables_by_catalog = {}
+                    for table_obj in tables:
+                        parts = table_obj['full_name'].split('.')
+                        if len(parts) >= 3:
+                            catalog = parts[0]
+                            if catalog not in tables_by_catalog:
+                                tables_by_catalog[catalog] = []
+                            tables_by_catalog[catalog].append(table_obj)
+                    
+                    for catalog, catalog_tables in tables_by_catalog.items():
+                        if is_cancelled():
+                            logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                            flask_app.improvement_status[run_id] = {
+                                'status': 'cancelled',
+                                'improvements': improvements,
+                                'total': len(improvements),
+                                'message': 'Cancelled by user'
+                            }
+                            return
+                        
+                        logger.info(f"🔄 Generating for {len(catalog_tables)} tables in catalog {catalog}")
+                        
+                        # Build table dicts with expected structure
+                        table_dicts = []
+                        for table_obj in catalog_tables:
+                            parts = table_obj['full_name'].split('.')
+                            catalog_name, schema_name, table_name = parts[0], parts[1], parts[2]
+                            table_dicts.append({
+                                'name': table_name,
+                                'full_name': table_obj['full_name'],
+                                'catalog_name': catalog_name,
+                                'schema_name': schema_name,
+                                'table_name': table_name,
+                                'table_type': 'TABLE',
+                                'comment': table_obj['current_description'],
+                                'owner': ''
+                            })
+                        
+                        results = await enhanced_gen._generate_tables_batch(
+                            table_dicts, catalog, model, run_id
+                        )
+                        
+                        for i, table_obj in enumerate(catalog_tables):
+                            if i < len(results):
+                                improvements.append({
+                                    'full_name': table_obj['full_name'],
+                                    'object_type': 'table',
+                                    'current_description': table_obj['current_description'],
+                                    'new_description': results[i].get('proposed_comment', ''),
+                                    'confidence': results[i].get('confidence_score', 0.0),
+                                    'source_model': model
+                                })
+                                update_progress(table_obj['full_name'])
+                
+                    # Generate for columns (batch by table)
+                    columns_by_table = {}
+                    for col_obj in columns:
+                        parts = col_obj['full_name'].split('.')
+                        if len(parts) >= 4:
+                            table_key = '.'.join(parts[:3])  # catalog.schema.table
+                            if table_key not in columns_by_table:
+                                columns_by_table[table_key] = []
+                            columns_by_table[table_key].append(col_obj)
+                    
+                    for table_key, table_columns in columns_by_table.items():
+                        if is_cancelled():
+                            logger.info(f"🛑 Generation cancelled for run {run_id} - returning {len(improvements)} partial results")
+                            flask_app.improvement_status[run_id] = {
+                                'status': 'cancelled',
+                                'improvements': improvements,
+                                'total': len(improvements),
+                                'message': 'Cancelled by user'
+                            }
+                            return
+                        
+                        parts = table_key.split('.')
+                        catalog, schema, table = parts[0], parts[1], parts[2]
+                        logger.info(f"🔄 Generating for {len(table_columns)} columns in table {table_key}")
+                        
+                        # OPTIMIZATION: Get column metadata with sample data ONCE for the entire table
+                        column_metadata = await enhanced_gen._get_table_columns_with_samples(
+                            catalog, schema, table
+                        )
+                        
+                        # Convert to a cache dict for fast lookup by column name
+                        table_sample_cache = {col['name']: col for col in column_metadata}
+                        logger.info(f"📦 Cached sample data for {len(table_sample_cache)} columns in {table_key}")
+                        
+                        # Build column dicts with expected structure including sample data
+                        column_dicts = []
+                        for col_obj in table_columns:
+                            column_name = col_obj['full_name'].split('.')[3]
+                            # Find matching metadata (note: _get_table_columns_with_samples uses 'name' key, not 'column_name')
+                            col_meta = next((c for c in column_metadata if c['name'] == column_name), {})
+                            
+                            column_dicts.append({
+                                'name': column_name,
+                                'full_name': col_obj['full_name'],
+                                'catalog_name': catalog,
+                                'schema_name': schema,
+                                'table_name': table,
+                                'column_name': column_name,
+                                'data_type': col_meta.get('data_type', ''),
+                                'is_nullable': '',  # Not returned by _get_table_columns_with_samples
+                                'column_default': '',  # Not returned by _get_table_columns_with_samples
+                                'comment': col_obj['current_description'],
+                                'sample_values': col_meta.get('sample_values', [])  # Include samples for context!
+                            })
+                        
+                        # Pass the cache to avoid redundant sampling queries
+                        result = await enhanced_gen._generate_column_chunk_metadata(
+                            column_dicts, model, run_id, is_improvement=True, table_sample_cache=table_sample_cache
+                        )
+                        
+                        # _generate_column_chunk_metadata returns a dict with 'metadata' key containing list of results
+                        metadata_list = result.get('metadata', [])
+                        for i, col_obj in enumerate(table_columns):
+                            if i < len(metadata_list):
+                                improvements.append({
+                                    'full_name': col_obj['full_name'],
+                                    'object_type': 'column',
+                                    'current_description': col_obj['current_description'],
+                                    'new_description': metadata_list[i].get('proposed_comment', ''),
+                                    'confidence': metadata_list[i].get('confidence_score', 0.0),
+                                    'source_model': model
+                                })
+                                update_progress(col_obj['full_name'])
                 
                 # Store results
                 if not hasattr(flask_app, 'improvement_status'):
