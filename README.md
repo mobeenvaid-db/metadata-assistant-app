@@ -39,7 +39,7 @@ SHOW CATALOGS LIKE 'uc_metadata_assistant';
 - Follows security best practice (least privilege)
 - Gives you control over catalog location and properties
 
-The app will automatically create the required schemas and tables on first launch.
+The app will automatically create the required schemas and tables on first launch. There may be situations where you're required to create the schemas - review app logs on first launch to review any possible errors or failures. You may also prefer creating the schema if you want to specify the specific storage path for the schema creation (S3/ADLS)
 
 ### Step 3: Clone Repository to Workspace
 
