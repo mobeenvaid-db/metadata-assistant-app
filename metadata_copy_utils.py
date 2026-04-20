@@ -148,7 +148,219 @@ class MetadataCopyUtils:
         except Exception as e:
             logger.error(f"Error fetching objects with descriptions: {e}")
             raise
-    
+
+    @staticmethod
+    def _sql_lit(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _instr_search_sql(column_expr: str, q: str) -> str:
+        s = (q or "").strip()
+        if not s:
+            return ""
+        lit = "'" + s.lower().replace("'", "''") + "'"
+        return f" AND instr(lower({column_expr}), lower({lit})) > 0 "
+
+    def page_described_schemas(
+        self, catalog_name: str, q: str = "", offset: int = 0, limit: int = 500
+    ) -> Tuple[List[Dict], bool]:
+        """Improvement workflow: schemas with descriptions, search + page."""
+        lim = max(1, min(int(limit), 2000))
+        off = max(0, int(offset))
+        fetch_n = lim + 1
+        search_sql = self._instr_search_sql(
+            "concat(s.catalog_name, '.', s.schema_name)", q
+        )
+        schema_sql = f"""
+            SELECT 
+                CONCAT(s.catalog_name, '.', s.schema_name) as full_name,
+                s.comment as description,
+                s.created as created_at,
+                COALESCE(t.table_count, 0) as table_count
+            FROM {catalog_name}.information_schema.schemata s
+            LEFT JOIN (
+                SELECT table_catalog, table_schema, COUNT(*) as table_count
+                FROM {catalog_name}.information_schema.tables
+                WHERE table_catalog = '{catalog_name}'
+                GROUP BY table_catalog, table_schema
+            ) t ON s.catalog_name = t.table_catalog AND s.schema_name = t.table_schema
+            WHERE s.catalog_name = '{catalog_name}'
+                AND s.schema_name NOT IN ('information_schema', 'system')
+                AND s.comment IS NOT NULL
+                AND s.comment != ''
+                {search_sql}
+            ORDER BY full_name
+            LIMIT {fetch_n} OFFSET {off}
+        """
+        rows = self.unity_service._execute_sql_warehouse(schema_sql) or []
+        has_more = len(rows) > lim
+        rows = rows[:lim]
+        out = [
+            {
+                'full_name': row[0],
+                'description': row[1],
+                'created_at': row[2],
+                'table_count': row[3],
+            }
+            for row in rows
+        ]
+        return out, has_more
+
+    def page_described_tables(
+        self,
+        catalog_name: str,
+        q: str = "",
+        schema_names: Optional[List[str]] = None,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Improvement workflow: tables with descriptions, optional schema allow-list."""
+        lim = max(1, min(int(limit), 2000))
+        off = max(0, int(offset))
+        fetch_n = lim + 1
+        search_sql = self._instr_search_sql(
+            "concat(table_catalog, '.', table_schema, '.', table_name)", q
+        )
+        schema_filter = ""
+        if schema_names:
+            in_list = ",".join(self._sql_lit(sn) for sn in schema_names if sn)
+            if in_list:
+                schema_filter = f" AND table_schema IN ({in_list}) "
+        table_sql = f"""
+            SELECT 
+                CONCAT(table_catalog, '.', table_schema, '.', table_name) as full_name,
+                comment as description,
+                created as created_at,
+                table_schema,
+                (SELECT COUNT(*) 
+                 FROM {catalog_name}.information_schema.columns c 
+                 WHERE c.table_catalog = t.table_catalog 
+                   AND c.table_schema = t.table_schema 
+                   AND c.table_name = t.table_name) as column_count
+            FROM {catalog_name}.information_schema.tables t
+            WHERE table_catalog = '{catalog_name}'
+                AND table_schema NOT IN ('information_schema', 'system')
+                AND comment IS NOT NULL
+                AND comment != ''
+                {schema_filter}
+                {search_sql}
+            ORDER BY full_name
+            LIMIT {fetch_n} OFFSET {off}
+        """
+        rows = self.unity_service._execute_sql_warehouse(table_sql) or []
+        has_more = len(rows) > lim
+        rows = rows[:lim]
+        out = [
+            {
+                'full_name': row[0],
+                'description': row[1],
+                'created_at': row[2],
+                'schema': row[3],
+                'column_count': row[4],
+            }
+            for row in rows
+        ]
+        return out, has_more
+
+    def page_described_columns_for_tables(
+        self,
+        catalog_name: str,
+        table_full_names: List[str],
+        q: str = "",
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Improvement workflow: described columns only under selected tables."""
+        if not table_full_names:
+            return [], False
+        lim = max(1, min(int(limit), 2000))
+        off = max(0, int(offset))
+        fetch_n = lim + 1
+        in_list = ",".join(self._sql_lit(t) for t in table_full_names if t)
+        if not in_list:
+            return [], False
+        search_sql = self._instr_search_sql(
+            "concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name)",
+            q,
+        )
+        column_sql = f"""
+            SELECT 
+                CONCAT(table_catalog, '.', table_schema, '.', table_name, '.', column_name) as full_name,
+                comment as description,
+                data_type,
+                table_schema,
+                table_name
+            FROM {catalog_name}.information_schema.columns
+            WHERE table_catalog = '{catalog_name}'
+                AND table_schema NOT IN ('information_schema', 'system')
+                AND comment IS NOT NULL
+                AND comment != ''
+                AND CONCAT(table_catalog, '.', table_schema, '.', table_name) IN ({in_list})
+                {search_sql}
+            ORDER BY full_name
+            LIMIT {fetch_n} OFFSET {off}
+        """
+        rows = self.unity_service._execute_sql_warehouse(column_sql) or []
+        has_more = len(rows) > lim
+        rows = rows[:lim]
+        out = [
+            {
+                'full_name': row[0],
+                'description': row[1],
+                'data_type': row[2],
+                'schema': row[3],
+                'table': row[4],
+            }
+            for row in rows
+        ]
+        return out, has_more
+
+    def page_described_columns_catalog(
+        self,
+        catalog_name: str,
+        q: str = "",
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Described columns across the catalog (paged); use when no table scope."""
+        lim = max(1, min(int(limit), 2000))
+        off = max(0, int(offset))
+        fetch_n = lim + 1
+        search_sql = self._instr_search_sql(
+            "concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name)",
+            q,
+        )
+        column_sql = f"""
+            SELECT 
+                CONCAT(table_catalog, '.', table_schema, '.', table_name, '.', column_name) as full_name,
+                comment as description,
+                data_type,
+                table_schema,
+                table_name
+            FROM {catalog_name}.information_schema.columns
+            WHERE table_catalog = '{catalog_name}'
+                AND table_schema NOT IN ('information_schema', 'system')
+                AND comment IS NOT NULL
+                AND comment != ''
+                {search_sql}
+            ORDER BY full_name
+            LIMIT {fetch_n} OFFSET {off}
+        """
+        rows = self.unity_service._execute_sql_warehouse(column_sql) or []
+        has_more = len(rows) > lim
+        rows = rows[:lim]
+        out = [
+            {
+                'full_name': row[0],
+                'description': row[1],
+                'data_type': row[2],
+                'schema': row[3],
+                'table': row[4],
+            }
+            for row in rows
+        ]
+        return out, has_more
+
     def get_objects_without_descriptions(self, catalog_name: str, schema_name: Optional[str] = None, object_type: Optional[str] = None) -> Dict:
         """
         Get objects WITHOUT descriptions (undocumented objects) from a catalog
