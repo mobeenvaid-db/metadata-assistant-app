@@ -10,5 +10,5 @@ env:
   - name: 'DATABRICKS_HTTP_PATH'
     value: 'YOUR HTTP PATH'
   - name: 'DATABRICKS_SERVER_HOSTNAME'
-    value: 'YOUR SQL WAREHOUSE HOSTNAME'
+    value: 'YOUR HOSTNAME'
 
