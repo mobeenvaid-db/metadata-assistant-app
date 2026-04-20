@@ -10,7 +10,7 @@ import logging
 import requests
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
@@ -543,6 +543,256 @@ class UnityMetadataService:
         except Exception as e:
             logger.error(f"Error fetching columns for {catalog_name}: {e}")
             return []
+
+    @staticmethod
+    def _sql_string_literal(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _search_predicate_sql(column_expr: str, search: str) -> str:
+        s = (search or "").strip()
+        if not s:
+            return ""
+        lit = UnityMetadataService._sql_string_literal(s.lower())
+        return f" AND instr(lower({column_expr}), lower({lit})) > 0 "
+
+    def _trim_page(self, rows: List, limit: int) -> Tuple[List, bool]:
+        has_more = len(rows) > limit
+        return (rows[:limit] if limit else rows), has_more
+
+    def get_schemas_with_missing_metadata_page(
+        self,
+        catalog_name: str,
+        search: str = "",
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Paged/searchable schemas missing descriptions (SQL warehouse)."""
+        try:
+            lim = max(1, min(int(limit), 2000))
+            off = max(0, int(offset))
+            fetch_n = lim + 1
+            sp = self._search_predicate_sql(
+                "concat(catalog_name, '.', schema_name)", search
+            )
+            sql_query = f"""
+                SELECT schema_name, schema_owner, created, last_altered
+                FROM {catalog_name}.information_schema.schemata 
+                WHERE catalog_name = '{catalog_name}' 
+                    AND (comment IS NULL OR comment = '')
+                    AND schema_name NOT IN ('information_schema', 'system')
+                    {sp}
+                ORDER BY schema_name
+                LIMIT {fetch_n} OFFSET {off}
+            """
+            data = self._execute_sql_warehouse(sql_query)
+            missing_metadata = []
+            for row in data or []:
+                schema_name = row[0] if len(row) > 0 else ''
+                schema_owner = row[1] if len(row) > 1 else ''
+                created = row[2] if len(row) > 2 else ''
+                updated = row[3] if len(row) > 3 else ''
+                missing_metadata.append({
+                    'name': schema_name,
+                    'full_name': f"{catalog_name}.{schema_name}",
+                    'catalog_name': catalog_name,
+                    'comment': '',
+                    'owner': schema_owner,
+                    'created_at': created,
+                    'updated_at': updated
+                })
+            missing_metadata, has_more = self._trim_page(missing_metadata, lim)
+            return missing_metadata, has_more
+        except Exception as e:
+            logger.warning(f"Paged schemas query failed for {catalog_name}: {e}")
+            return [], False
+
+    def get_tables_with_missing_metadata_page(
+        self,
+        catalog_name: str,
+        search: str = "",
+        schema_names: Optional[List[str]] = None,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Paged/searchable tables missing descriptions; optional schema allow-list."""
+        try:
+            lim = max(1, min(int(limit), 2000))
+            off = max(0, int(offset))
+            fetch_n = lim + 1
+            sp = self._search_predicate_sql(
+                "concat(table_catalog, '.', table_schema, '.', table_name)", search
+            )
+            schema_filter = ""
+            if schema_names:
+                in_list = ",".join(
+                    self._sql_string_literal(sn) for sn in schema_names if sn
+                )
+                if in_list:
+                    schema_filter = f" AND table_schema IN ({in_list}) "
+            sql_query = f"""
+                SELECT table_schema, table_name, table_type, table_owner, created, last_altered,
+                       concat(table_catalog, '.', table_schema, '.', table_name) as full_name
+                FROM {catalog_name}.information_schema.tables 
+                WHERE table_catalog = '{catalog_name}' 
+                    AND (comment IS NULL OR comment = '')
+                    AND table_schema NOT IN ('information_schema', 'system')
+                    {schema_filter}
+                    {sp}
+                ORDER BY table_schema, table_name
+                LIMIT {fetch_n} OFFSET {off}
+            """
+            data = self._execute_sql_warehouse(sql_query)
+            missing_metadata = []
+            for row in data or []:
+                schema_name = row[0] if len(row) > 0 else ''
+                table_name = row[1] if len(row) > 1 else ''
+                table_type = row[2] if len(row) > 2 else ''
+                table_owner = row[3] if len(row) > 3 else ''
+                created = row[4] if len(row) > 4 else ''
+                updated = row[5] if len(row) > 5 else ''
+                full_name = row[6] if len(row) > 6 else f"{catalog_name}.{schema_name}.{table_name}"
+                missing_metadata.append({
+                    'name': table_name,
+                    'full_name': full_name,
+                    'catalog_name': catalog_name,
+                    'schema_name': schema_name,
+                    'table_type': table_type,
+                    'comment': '',
+                    'owner': table_owner,
+                    'created_at': created,
+                    'updated_at': updated
+                })
+            missing_metadata, has_more = self._trim_page(missing_metadata, lim)
+            return missing_metadata, has_more
+        except Exception as e:
+            logger.warning(f"Paged tables query failed for {catalog_name}: {e}")
+            return [], False
+
+    def get_columns_with_missing_metadata_for_tables_page(
+        self,
+        catalog_name: str,
+        table_full_names: List[str],
+        search: str = "",
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Columns missing comments, restricted to an explicit set of tables (catalog.schema.table)."""
+        if not table_full_names:
+            return [], False
+        try:
+            lim = max(1, min(int(limit), 2000))
+            off = max(0, int(offset))
+            fetch_n = lim + 1
+            in_list = ",".join(
+                self._sql_string_literal(t) for t in table_full_names if t
+            )
+            if not in_list:
+                return [], False
+            sp = self._search_predicate_sql(
+                "concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name)",
+                search
+            )
+            sql_query = f"""
+                SELECT table_schema, table_name, column_name, data_type, column_default, is_nullable, ordinal_position,
+                       concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name) as full_name
+                FROM {catalog_name}.information_schema.columns 
+                WHERE table_catalog = '{catalog_name}' 
+                    AND (comment IS NULL OR comment = '')
+                    AND table_schema NOT IN ('information_schema', 'system')
+                    AND concat(table_catalog, '.', table_schema, '.', table_name) IN ({in_list})
+                    {sp}
+                ORDER BY table_schema, table_name, ordinal_position
+                LIMIT {fetch_n} OFFSET {off}
+            """
+            data = self._execute_sql_warehouse(sql_query)
+            missing_metadata = []
+            for row in data or []:
+                schema_name = row[0] if len(row) > 0 else ''
+                table_name = row[1] if len(row) > 1 else ''
+                column_name = row[2] if len(row) > 2 else ''
+                data_type = row[3] if len(row) > 3 else ''
+                column_default = row[4] if len(row) > 4 else ''
+                is_nullable = row[5] if len(row) > 5 else True
+                ordinal_position = row[6] if len(row) > 6 else 0
+                full_name = row[7] if len(row) > 7 else f"{catalog_name}.{schema_name}.{table_name}.{column_name}"
+                missing_metadata.append({
+                    'name': column_name,
+                    'full_name': full_name,
+                    'catalog_name': catalog_name,
+                    'schema_name': schema_name,
+                    'table_name': table_name,
+                    'column_name': column_name,
+                    'data_type': data_type,
+                    'comment': '',
+                    'nullable': is_nullable,
+                    'position': ordinal_position
+                })
+            missing_metadata, has_more = self._trim_page(missing_metadata, lim)
+            return missing_metadata, has_more
+        except Exception as e:
+            logger.warning(
+                f"Paged scoped columns query failed for {catalog_name}: {e}"
+            )
+            return [], False
+
+    def get_columns_with_missing_metadata_page(
+        self,
+        catalog_name: str,
+        search: str = "",
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Tuple[List[Dict], bool]:
+        """Paged/searchable columns missing comments across the whole catalog."""
+        try:
+            lim = max(1, min(int(limit), 2000))
+            off = max(0, int(offset))
+            fetch_n = lim + 1
+            sp = self._search_predicate_sql(
+                "concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name)",
+                search,
+            )
+            sql_query = f"""
+                SELECT table_schema, table_name, column_name, data_type, column_default, is_nullable, ordinal_position,
+                       concat(table_catalog, '.', table_schema, '.', table_name, '.', column_name) as full_name
+                FROM {catalog_name}.information_schema.columns 
+                WHERE table_catalog = '{catalog_name}' 
+                    AND (comment IS NULL OR comment = '')
+                    AND table_schema NOT IN ('information_schema', 'system')
+                    {sp}
+                ORDER BY table_schema, table_name, ordinal_position
+                LIMIT {fetch_n} OFFSET {off}
+            """
+            data = self._execute_sql_warehouse(sql_query)
+            missing_metadata = []
+            for row in data or []:
+                schema_name = row[0] if len(row) > 0 else ''
+                table_name = row[1] if len(row) > 1 else ''
+                column_name = row[2] if len(row) > 2 else ''
+                data_type = row[3] if len(row) > 3 else ''
+                column_default = row[4] if len(row) > 4 else ''
+                is_nullable = row[5] if len(row) > 5 else True
+                ordinal_position = row[6] if len(row) > 6 else 0
+                full_name = row[7] if len(row) > 7 else f"{catalog_name}.{schema_name}.{table_name}.{column_name}"
+                missing_metadata.append({
+                    'name': column_name,
+                    'full_name': full_name,
+                    'catalog_name': catalog_name,
+                    'schema_name': schema_name,
+                    'table_name': table_name,
+                    'column_name': column_name,
+                    'data_type': data_type,
+                    'comment': '',
+                    'nullable': is_nullable,
+                    'position': ordinal_position
+                })
+            missing_metadata, has_more = self._trim_page(missing_metadata, lim)
+            return missing_metadata, has_more
+        except Exception as e:
+            logger.warning(
+                f"Paged catalog columns query failed for {catalog_name}: {e}"
+            )
+            return [], False
 
     def get_objects_with_missing_tags(self, catalog_name: str) -> List[Dict]:
         """Get objects (schemas, tables, columns) with missing tags using real tag data from system.information_schema"""

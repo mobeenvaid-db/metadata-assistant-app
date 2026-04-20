@@ -6,7 +6,7 @@ This version serves the React frontend and proxies API calls to the existing bac
 import os
 import logging
 import asyncio
-from flask import Flask, send_from_directory, jsonify
+from flask import Flask, send_from_directory, jsonify, request
 from flask_cors import CORS
 
 # Import all existing services and endpoints from the original app
@@ -1436,95 +1436,175 @@ For each column, provide a description that includes:"""
 
 # --------------------------- Generate API Routes -----------------------------------
 
-@flask_app.route("/api/generation-options/<catalog_name>/<object_type>")
+def _parse_options_request():
+    """Shared query/body parsing for paged generation & improvement option APIs."""
+    if request.method == "POST" and request.is_json:
+        body = request.get_json(silent=True) or {}
+        q = (body.get("q") or "").strip()
+        offset = int(body.get("offset", 0))
+        limit = int(body.get("limit", 500))
+        schemas = body.get("schemas") or []
+        tables = body.get("tables") or []
+        if isinstance(schemas, str):
+            schemas = [s for s in schemas.split(",") if s.strip()]
+        if isinstance(tables, str):
+            tables = [s for s in tables.split(",") if s.strip()]
+    else:
+        q = (request.args.get("q") or "").strip()
+        offset = int(request.args.get("offset", 0))
+        limit = int(request.args.get("limit", 500))
+        schemas = [s for s in (request.args.get("schemas") or "").split(",") if s.strip()]
+        tables = [s for s in (request.args.get("tables") or "").split(",") if s.strip()]
+    limit = max(1, min(limit, 2000))
+    offset = max(0, offset)
+    return q, offset, limit, schemas, tables
+
+
+@flask_app.route(
+    "/api/generation-options/<catalog_name>/<object_type>", methods=["GET", "POST"]
+)
 def api_generation_options(catalog_name, object_type):
-    """Get objects with missing metadata for generation selection"""
+    """Paged/searchable objects with missing metadata; columns optional table scope."""
     try:
-        logger.info(f"Getting generation options for {catalog_name}/{object_type}")
-        
-        # Get unity service instance
+        q, offset, limit, schema_names, table_full_names = _parse_options_request()
+        logger.info(
+            f"Getting generation options for {catalog_name}/{object_type} "
+            f"(offset={offset}, limit={limit}, q={q!r}, schemas={len(schema_names)}, tables={len(table_full_names)})"
+        )
+
         unity = get_unity_service()
-        
-        # Map object_type to the correct method
-        if object_type == 'schemas':
-            objects = unity.get_schemas_with_missing_metadata(catalog_name)
-        elif object_type == 'tables':
-            objects = unity.get_tables_with_missing_metadata(catalog_name)
-        elif object_type == 'columns':
-            objects = unity.get_columns_with_missing_metadata(catalog_name)
+
+        if object_type == "schemas":
+            objects, has_more = unity.get_schemas_with_missing_metadata_page(
+                catalog_name, search=q, offset=offset, limit=limit
+            )
+        elif object_type == "tables":
+            objects, has_more = unity.get_tables_with_missing_metadata_page(
+                catalog_name,
+                search=q,
+                schema_names=schema_names or None,
+                offset=offset,
+                limit=limit,
+            )
+        elif object_type == "columns":
+            if table_full_names:
+                objects, has_more = unity.get_columns_with_missing_metadata_for_tables_page(
+                    catalog_name,
+                    table_full_names=table_full_names,
+                    search=q,
+                    offset=offset,
+                    limit=limit,
+                )
+            else:
+                objects, has_more = unity.get_columns_with_missing_metadata_page(
+                    catalog_name, search=q, offset=offset, limit=limit
+                )
         else:
             return jsonify({"error": f"Invalid object type: {object_type}"}), 400
-        
-        return jsonify({
-            "success": True,
-            "catalog": catalog_name,
-            "object_type": object_type,
-            "objects": objects,
-            "count": len(objects)
-        })
+
+        return jsonify(
+            {
+                "success": True,
+                "catalog": catalog_name,
+                "object_type": object_type,
+                "objects": objects,
+                "count": len(objects),
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+            }
+        )
     except Exception as e:
         logger.error(f"Error getting generation options: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@flask_app.route("/api/improvement-options/<catalog_name>/<object_type>")
+@flask_app.route(
+    "/api/improvement-options/<catalog_name>/<object_type>", methods=["GET", "POST"]
+)
 def api_improvement_options(catalog_name, object_type):
-    """Get objects WITH descriptions for improvement/quality scanning"""
+    """Paged/searchable objects with descriptions; columns optional table scope."""
     try:
-        logger.info(f"Getting improvement options for {catalog_name}/{object_type}")
-        
-        # Get unity service instance
+        q, offset, limit, schema_names, table_full_names = _parse_options_request()
+        logger.info(
+            f"Getting improvement options for {catalog_name}/{object_type} "
+            f"(offset={offset}, limit={limit}, q={q!r}, schemas={len(schema_names)}, tables={len(table_full_names)})"
+        )
+
         unity = get_unity_service()
         copy_utils = MetadataCopyUtils(unity)
-        
-        # Get all described objects
-        described_objects = copy_utils.get_objects_with_descriptions(catalog_name)
-        
-        # Filter by object type and format for UI
-        if object_type == 'schemas':
+
+        if object_type == "schemas":
+            raw, has_more = copy_utils.page_described_schemas(
+                catalog_name, q=q, offset=offset, limit=limit
+            )
             objects = [
                 {
-                    'name': obj['full_name'].split('.')[-1],  # Extract schema name from "catalog.schema"
-                    'full_name': obj['full_name'],
-                    'description': obj['description'],
-                    'table_count': obj.get('table_count', 0)
+                    "name": obj["full_name"].split(".")[-1],
+                    "full_name": obj["full_name"],
+                    "description": obj["description"],
+                    "table_count": obj.get("table_count", 0),
                 }
-                for obj in described_objects['schemas']
+                for obj in raw
             ]
-        elif object_type == 'tables':
+        elif object_type == "tables":
+            raw, has_more = copy_utils.page_described_tables(
+                catalog_name,
+                q=q,
+                schema_names=schema_names or None,
+                offset=offset,
+                limit=limit,
+            )
             objects = [
                 {
-                    'name': obj['full_name'].split('.')[-1],  # Extract table name from "catalog.schema.table"
-                    'full_name': obj['full_name'],
-                    'schema': obj['schema'],
-                    'description': obj['description'],
-                    'column_count': obj.get('column_count', 0)
+                    "name": obj["full_name"].split(".")[-1],
+                    "full_name": obj["full_name"],
+                    "schema": obj["schema"],
+                    "description": obj["description"],
+                    "column_count": obj.get("column_count", 0),
                 }
-                for obj in described_objects['tables']
+                for obj in raw
             ]
-        elif object_type == 'columns':
+        elif object_type == "columns":
+            if table_full_names:
+                raw, has_more = copy_utils.page_described_columns_for_tables(
+                    catalog_name,
+                    table_full_names=table_full_names,
+                    q=q,
+                    offset=offset,
+                    limit=limit,
+                )
+            else:
+                raw, has_more = copy_utils.page_described_columns_catalog(
+                    catalog_name, q=q, offset=offset, limit=limit
+                )
             objects = [
                 {
-                    'name': obj['full_name'].split('.')[-1],  # Extract column name from "catalog.schema.table.column"
-                    'full_name': obj['full_name'],
-                    'table': obj.get('table', ''),
-                    'data_type': obj.get('data_type', 'unknown'),
-                    'description': obj['description']
+                    "name": obj["full_name"].split(".")[-1],
+                    "full_name": obj["full_name"],
+                    "table": obj.get("table", ""),
+                    "data_type": obj.get("data_type", "unknown"),
+                    "description": obj["description"],
                 }
-                for obj in described_objects['columns']
+                for obj in raw
             ]
         else:
             return jsonify({"error": f"Invalid object type: {object_type}"}), 400
-        
-        logger.info(f"Found {len(objects)} described {object_type} in {catalog_name}")
-        
-        return jsonify({
-            "success": True,
-            "catalog": catalog_name,
-            "object_type": object_type,
-            "objects": objects,
-            "count": len(objects)
-        })
+
+        logger.info(f"Found {len(objects)} described {object_type} in {catalog_name} (page)")
+
+        return jsonify(
+            {
+                "success": True,
+                "catalog": catalog_name,
+                "object_type": object_type,
+                "objects": objects,
+                "count": len(objects),
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+            }
+        )
     except Exception as e:
         logger.error(f"Error getting improvement options: {e}")
         return jsonify({"error": str(e)}), 500
@@ -4032,14 +4112,17 @@ def api_download_improvements_csv():
         output = io.StringIO()
         writer = csv.writer(output)
         
-        # Write header
+        # Write header (source_model / confidence / is_chosen_variant support multi-LLM comparison export)
         writer.writerow([
             'full_name',
             'object_type',
             'current_description',
             'improved_description',
             'quality_score',
-            'quality_category'
+            'quality_category',
+            'source_model',
+            'confidence',
+            'is_chosen_variant',
         ])
         
         # Write data rows
@@ -4050,7 +4133,10 @@ def api_download_improvements_csv():
                 improvement.get('current_description', ''),
                 improvement.get('improved_description', ''),
                 improvement.get('quality_score', ''),
-                improvement.get('quality_category', '')
+                improvement.get('quality_category', ''),
+                improvement.get('source_model', ''),
+                improvement.get('confidence', ''),
+                improvement.get('is_chosen_variant', ''),
             ])
         
         # Prepare file for download
